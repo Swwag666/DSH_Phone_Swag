@@ -1,0 +1,19 @@
+# Node deps & build output
+node_modules/
+dist/
+
+# Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# Binaries
+*.exe
+dsh-phone.exe
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+*.log
+
+# secrets / local runtime config
+dsh-phone/config.json

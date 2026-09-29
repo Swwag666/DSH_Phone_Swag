@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0d" />
+  <title>DSH PHONE</title>
+  <link rel="manifest" href="/manifest.json?v=10" />
+  <link rel="stylesheet" href="/style.css?v=10" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <button id="back" class="hidden">←</button>
+      <div class="top-title">DSH PHONE</div>
+      <button id="refresh" title="Обновить">⟳</button>
+      <button id="new-btn" title="Новый чат" class="hidden">+</button>
+      <button id="model-btn" class="hidden" title="Модель и доступ">⚙</button>
+      <button id="status-dot" class="dot off" title="bridge"></button>
+      <button id="menu-btn" title="Протокол">☰</button>
+    </header>
+
+    <section id="view-auth" class="view">
+      <div class="auth-card">
+        <div class="auth-emblem">◆</div>
+        <div class="auth-title">DSH PHONE</div>
+        <div class="auth-tag">порядок · честь · протокол</div>
+        <p>Предъяви ключ доступа. Он в файле <code>config.json</code> на ПК или в логе запуска узла.</p>
+        <input id="token-input" placeholder="ключ доступа" autocomplete="off" autocapitalize="off" autocorrect="off" />
+        <button id="auth-go">Предъявить ключ</button>
+        <div id="auth-err" class="err"></div>
+        <div class="auth-stamp">гриф: без свидетелей · сбор пассивный</div>
+      </div>
+    </section>
+
+    <section id="view-list" class="view hidden">
+      <div id="groups"></div>
+    </section>
+
+    <section id="view-chat" class="view hidden">
+      <div id="chat-meta"></div>
+      <div id="chat-items"></div>
+      <button id="jumplast" class="hidden" title="Вниз">↓</button>
+      <div id="approval"></div>
+      <div id="attach-chips" class="hidden"></div>
+      <form id="composer">
+        <button id="attach" type="button" title="Добавить файл">📎</button>
+        <input id="file-input" type="file" multiple hidden />
+        <textarea id="input" rows="1" placeholder="Сообщение…"></textarea>
+        <button id="send" type="submit">➤</button>
+        <button id="interrupt" type="button" title="Стоп">■</button>
+      </form>
+    </section>
+
+    <div id="statusline"></div>
+  </div>
+
+  <div id="model-sheet" class="hidden">
+    <div id="model-sheet-body">
+      <div id="model-sheet-head"><span>Модель и доступ</span><button id="model-close">✕</button></div>
+      <div class="sheet-sec">Модель</div>
+      <div id="model-list"></div>
+      <div class="sheet-sec">Доступ</div>
+      <div id="perm-list"></div>
+      <div id="model-current"></div>
+    </div>
+  </div>
+
+  <div id="new-sheet" class="hidden">
+    <div id="new-sheet-body">
+      <div id="new-sheet-head"><span>Новый чат</span><button id="new-close">✕</button></div>
+      <div class="sheet-sec">Папка</div>
+      <input id="new-cwd" list="ws-list" placeholder="C:\путь\к\папке" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <datalist id="ws-list"></datalist>
+      <div class="sheet-sec">Первое сообщение</div>
+      <textarea id="new-text" rows="2" placeholder="привет (можно оставить пустым)"></textarea>
+      <button id="new-create">Создать</button>
+      <div id="new-err" class="err"></div>
+    </div>
+  </div>
+
+  <div id="menu-sheet" class="hidden">
+    <div id="menu-sheet-body">
+      <div id="menu-head"><span>Протокол</span><button id="menu-close">✕</button></div>
+      <div class="menu-brand">
+        <div class="menu-emblem">◆</div>
+        <div>
+          <div class="menu-title">DSH PHONE</div>
+          <div class="menu-sub">узел личной связи · без свидетелей</div>
+        </div>
+      </div>
+      <div class="sheet-sec">Связь</div>
+      <div id="menu-info" class="menu-info">…</div>
+      <div class="sheet-sec">Фишки</div>
+      <div class="pick" id="menu-crt"><span>Экран-плёнка (CRT)</span><span id="crt-state">выкл</span></div>
+      <div class="sheet-sec">Действия</div>
+      <button class="pick menu-act" id="menu-reload">Перезагрузить узел</button>
+      <button class="pick menu-act menu-danger" id="menu-wipe">Стереть ключ доступа</button>
+      <div class="menu-foot" id="menu-time">фиксация …</div>
+    </div>
+  </div>
+
+  <div class="scanlines"></div>
+  <div class="crt-sweep"></div>
+
+  <script src="/app.js?v=10"></script>
+  <script>
+    (function () {
+      var $ = function (id) { return document.getElementById(id); };
+      var menu = $("menu-sheet");
+      var open = function () { menu.classList.remove("hidden"); refreshInfo(); };
+      var close = function () { menu.classList.add("hidden"); };
+      $("menu-btn").onclick = open;
+      $("menu-close").onclick = close;
+      menu.addEventListener("click", function (e) { if (e.target === menu) close(); });
+
+      function fmtUptime(s) {
+        if (s < 60) return s + "с";
+        var m = Math.floor(s / 60);
+        if (m < 60) return m + "м " + (s % 60) + "с";
+        var h = Math.floor(m / 60);
+        return h + "ч " + (m % 60) + "м";
+      }
+      function refreshInfo() {
+        fetch("/api/health").then(function (r) { return r.json(); }).then(function (h) {
+          var on = h && h.bridge === "connected";
+          var html = '<div class="menu-row"><span>мост</span><span' + (on ? ' class="live"' : "") + '>' + (on ? "соединён" : "разорван") + "</span></div>";
+          html += '<div class="menu-row"><span>аптайм</span><span>' + (h ? fmtUptime(h.uptime || 0) : "—") + "</span></div>";
+          html += '<div class="menu-row"><span>запросов</span><span>' + (h ? (h.requests || 0) : "—") + "</span></div>";
+          $("menu-info").innerHTML = html;
+        }).catch(function () {
+          $("menu-info").innerHTML = '<div class="menu-row"><span>мост</span><span>нет связи</span></div>';
+        });
+      }
+
+      function tick() {
+        var d = new Date();
+        var p = function (n) { return (n < 10 ? "0" : "") + n; };
+        $("menu-time").textContent = "фиксация " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+      }
+      setInterval(tick, 1000);
+      tick();
+
+      var crtOn = localStorage.getItem("dsh-crt") === "1";
+      function applyCrt() {
+        document.body.classList.toggle("crt-on", crtOn);
+        $("crt-state").textContent = crtOn ? "вкл" : "выкл";
+      }
+      $("menu-crt").onclick = function () {
+        crtOn = !crtOn;
+        localStorage.setItem("dsh-crt", crtOn ? "1" : "0");
+        applyCrt();
+      };
+      applyCrt();
+
+      $("menu-reload").onclick = function () { location.reload(); };
+      $("menu-wipe").onclick = function () {
+        localStorage.removeItem("dsh-phone-token");
+        location.reload();
+      };
+    })();
+  </script>
+</body>
+</html>

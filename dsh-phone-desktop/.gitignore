@@ -1,0 +1,15 @@
+# deps & build artifacts
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# binaries
+*.exe
+*.msi
+*.dll
+
+# misc
+.DS_Store
+*.log
+Thumbs.db
