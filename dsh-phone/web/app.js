@@ -503,6 +503,8 @@ function fullRender() {
   const el = $("chat-items");
   rendered = new Set();
   nodeFor = new Map();
+  stopTw();
+  tw = { key: null, target: "", shown: 0, node: null, timer: null, active: false };
   computeLastUserText();
   updateMsgactions();
   const ordered = [...items.values()].sort((a, b) => (a.orderSeq || 0) - (b.orderSeq || 0)).filter((it) => !isBookkeeping(it));
@@ -523,6 +525,7 @@ function fullRender() {
   el.appendChild(frag);
   scrollToBottom();
   updateJump();
+  syncTypewriter();
 }
 
 function appendDom(arr) {
@@ -538,6 +541,7 @@ function appendDom(arr) {
   el.appendChild(frag);
   if (stick) el.scrollTop = el.scrollHeight;
   updateJump();
+  syncTypewriter();
 }
 
 function replaceDom(it) {
@@ -546,10 +550,16 @@ function replaceDom(it) {
   if (!old) { fullRender(); return; }
   const el = $("chat-items");
   const stick = nearBottom(el);
+  if (tw.active && tw.key === k) {
+    syncTypewriter();
+    if (stick) el.scrollTop = el.scrollHeight;
+    return;
+  }
   const node = renderOne(it);
   old.replaceWith(node);
   nodeFor.set(k, node);
   if (stick) el.scrollTop = el.scrollHeight;
+  syncTypewriter();
 }
 
 function mergeInto(list, isLive) {
@@ -593,6 +603,88 @@ function updateJump() {
 
 $("chat-items").addEventListener("scroll", updateJump);
 
+let tw = { key: null, target: "", shown: 0, node: null, timer: null, active: false };
+
+function stopTw() {
+  if (tw.timer) { clearInterval(tw.timer); tw.timer = null; }
+  tw.active = false;
+}
+
+function lastAssistantItem() {
+  let best = null, bo = -1;
+  for (const it of items.values()) {
+    if (it.role !== "assistant") continue;
+    const o = it.orderSeq || 0;
+    if (o > bo) { bo = o; best = it; }
+  }
+  return best;
+}
+
+function renderTwFrame() {
+  if (!tw.node) return;
+  const visible = tw.target.slice(0, tw.shown);
+  tw.node.textContent = "";
+  tw.node.appendChild(document.createTextNode(visible));
+  const cur = document.createElement("span");
+  cur.className = "twcur";
+  cur.textContent = "\u258c";
+  tw.node.appendChild(cur);
+}
+
+function twTick() {
+  const el = $("chat-items");
+  const stick = nearBottom(el);
+  const it = items.get(tw.key);
+  if (!tw.node || !tw.node.isConnected) { stopTw(); tw.key = null; tw.node = null; return; }
+  if (it) tw.target = itemText(it)[1] || "";
+  if (tw.shown > tw.target.length) tw.shown = tw.target.length;
+  if (tw.shown >= tw.target.length) {
+    if (!isWorking(knownStatus)) {
+      const node = tw.node;
+      stopTw();
+      tw.key = null;
+      tw.node = null;
+      if (it && node.isConnected) {
+        const fresh = renderOne(it);
+        node.replaceWith(fresh);
+        nodeFor.set(keyOf(it), fresh);
+      }
+      if (stick) scrollToBottom();
+    }
+    return;
+  }
+  const backlog = tw.target.length - tw.shown;
+  const step = backlog > 1500 ? 20 : 3;
+  tw.shown = Math.min(tw.target.length, tw.shown + step);
+  renderTwFrame();
+  if (stick) el.scrollTop = el.scrollHeight;
+}
+
+function engageTw(node, key, target) {
+  stopTw();
+  tw.key = key;
+  tw.node = node;
+  tw.target = target;
+  tw.shown = 0;
+  tw.active = true;
+  renderTwFrame();
+  tw.timer = setInterval(twTick, 30);
+}
+
+function syncTypewriter() {
+  const it = lastAssistantItem();
+  if (!it) { stopTw(); tw.key = null; tw.node = null; return; }
+  const k = keyOf(it);
+  const node = nodeFor.get(k);
+  const txt = itemText(it)[1] || "";
+  if (isWorking(knownStatus) && node) {
+    if (tw.key !== k || !tw.active) engageTw(node, k, txt);
+    else { tw.target = txt; tw.node = node; }
+  } else if (tw.key === k && tw.active) {
+    tw.target = txt;
+  }
+}
+
 function isWorking(s) {
   return s === "running" || s === "working" || s === "waiting" || s === "pending";
 }
@@ -620,6 +712,7 @@ function applyState(st) {
   }
   checkApproval(st);
   updateMsgactions();
+  syncTypewriter();
 }
 
 function titleOf(sid) {

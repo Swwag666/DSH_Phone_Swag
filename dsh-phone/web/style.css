@@ -238,6 +238,8 @@ button { cursor: pointer; font-family: inherit; }
 .tk-com { color: #5f5f66; font-style: italic; }
 .tk-num { color: #c98a8a; }
 .tk-kw { color: #b08ad6; }
+.twcur { color: #c9a1a1; animation: twblink 0.9s steps(1) infinite; font-weight: 400; }
+@keyframes twblink { 50% { opacity: 0; } }
 
 /* menu button in the top bar */
 #menu-btn { background: none; border: 0; color: #8a3838; font-size: 17px; padding: 2px 6px; }
