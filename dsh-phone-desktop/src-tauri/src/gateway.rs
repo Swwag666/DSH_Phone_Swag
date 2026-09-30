@@ -44,6 +44,15 @@ pub fn now_ts() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn jitter_backoff(d: Duration) -> Duration {
+    let ms = d.as_millis() as u64;
+    if ms == 0 {
+        return d;
+    }
+    let extra = (rand::random::<f64>() * 0.25 * ms as f64) as u64;
+    Duration::from_millis(ms + extra)
+}
+
 impl Gateway {
     pub fn new(
         cfg: Arc<AppConfig>,
@@ -154,9 +163,11 @@ impl Gateway {
     // ---------------- background loops ----------------
 
     async fn bridge_loop(&self) {
+        let mut backoff = Duration::from_secs(1);
         loop {
-            match self.bridge.connect().await {
+            let was_connected = match self.bridge.connect().await {
                 Ok(()) => {
+                    backoff = Duration::from_secs(1);
                     self.push_event("bridge", json!({ "status": "connected" }));
                     let _ = self
                         .bridge
@@ -166,15 +177,22 @@ impl Gateway {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     self.push_event("bridge", json!({ "status": "disconnected" }));
+                    true
                 }
                 Err(e) => {
                     self.push_event(
                         "bridge",
-                        json!({ "status": "disconnected", "error": e }),
+                        json!({ "status": "disconnected", "error": e, "retry_in_secs": backoff.as_secs() }),
                     );
+                    false
                 }
+            };
+            if was_connected {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                tokio::time::sleep(jitter_backoff(backoff)).await;
+                backoff = (backoff * 2).min(Duration::from_secs(60));
             }
-            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 

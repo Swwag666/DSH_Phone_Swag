@@ -25,6 +25,9 @@ dirs = "5"
 get_if_addrs = "0.5"
 base64 = "0.22"
 sha2 = "0.10"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rcgen = "0.13"
+rustls-pemfile = "2"
 
 [profile.release]
 codegen-units = 1

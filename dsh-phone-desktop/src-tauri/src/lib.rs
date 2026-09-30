@@ -4,6 +4,7 @@ mod gateway;
 mod pwa;
 mod server;
 mod tailscale;
+mod tls;
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -188,6 +189,22 @@ fn set_start_hidden(enabled: bool) -> config::AppConfig {
     c
 }
 
+#[tauri::command]
+fn set_allowed_ips(ips: Vec<String>) -> config::AppConfig {
+    let mut c = config::AppConfig::load_or_init();
+    c.allowed_ips = ips;
+    let _ = c.save();
+    c
+}
+
+#[tauri::command]
+fn set_tls_enabled(enabled: bool) -> config::AppConfig {
+    let mut c = config::AppConfig::load_or_init();
+    c.tls_enabled = enabled;
+    let _ = c.save();
+    c
+}
+
 fn show_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -228,7 +245,9 @@ pub fn run() {
             tailscale_install,
             get_autostart,
             set_autostart,
-            set_start_hidden
+            set_start_hidden,
+            set_allowed_ips,
+            set_tls_enabled
         ])
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);

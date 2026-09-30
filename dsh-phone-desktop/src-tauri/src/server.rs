@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     body::Body,
-    extract::{Query, Request, State},
+    extract::{ConnectInfo, Query, Request, State},
     http::{header, StatusCode, Uri},
     middleware::{self, Next},
     response::Response,
@@ -56,18 +57,21 @@ fn static_response(ctype: &'static str, body: String) -> Response {
 }
 
 async fn health(State(gw): State<Arc<Gateway>>) -> Response {
-    json_status(
-        StatusCode::OK,
-        json!({
-            "ok": true,
-            "runtime": "rust",
-            "bridge": if gw.is_bridge_connected() { "connected" } else { "disconnected" },
-            "uptime": gw.started_at.elapsed().as_secs(),
-            "requests": gw.requests.load(Ordering::Relaxed),
-            "version": env!("CARGO_PKG_VERSION"),
-            "tailscale": gw.cfg.tailscale_ip,
-        }),
-    )
+    let mut obj = json!({
+        "ok": true,
+        "runtime": "rust",
+        "bridge": if gw.is_bridge_connected() { "connected" } else { "disconnected" },
+        "uptime": gw.started_at.elapsed().as_secs(),
+        "requests": gw.requests.load(Ordering::Relaxed),
+        "version": env!("CARGO_PKG_VERSION"),
+        "tailscale": gw.cfg.tailscale_ip,
+        "tls": if gw.cfg.tls_enabled { "on" } else { "off" },
+        "allowlist": gw.cfg.allowed_ips,
+    });
+    if gw.cfg.tls_enabled {
+        obj["tls_sha256"] = json!(crate::tls::cert_sha256());
+    }
+    json_status(StatusCode::OK, obj)
 }
 
 #[derive(Deserialize)]
@@ -275,6 +279,18 @@ async fn count_reqs(State(gw): State<Arc<Gateway>>, req: Request, next: Next) ->
     next.run(req).await
 }
 
+async fn ip_filter(State(gw): State<Arc<Gateway>>, req: Request, next: Next) -> Response {
+    if let Some(ci) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        if !gw.cfg.allow_ip(ci.0.ip()) {
+            return json_status(
+                StatusCode::FORBIDDEN,
+                json!({ "ok": false, "error": "ip_not_allowed" }),
+            );
+        }
+    }
+    next.run(req).await
+}
+
 pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
     let port = gw.cfg.listen_port;
     let app = Router::new()
@@ -286,9 +302,44 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .route("/", get(root))
         .fallback(static_fallback)
         .layer(middleware::from_fn_with_state(gw.clone(), count_reqs))
-        .with_state(gw);
+        .layer(middleware::from_fn_with_state(gw.clone(), ip_filter))
+        .with_state(gw.clone());
 
     let addr = std::net::SocketAddr::from(([0u8, 0, 0, 0], port));
+
+    if gw.cfg.tls_enabled {
+        match crate::tls::rustls_config(&gw.cfg).await {
+            Ok(config) => {
+                eprintln!(
+                    "dsh-phone: TLS on :{port} sha256={}",
+                    crate::tls::cert_sha256().unwrap_or_default()
+                );
+                let handle = axum_server::Handle::new();
+                let h2 = handle.clone();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    h2.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+                });
+                let _ = axum_server::bind_rustls(addr, config)
+                    .handle(handle)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await;
+            }
+            Err(e) => {
+                eprintln!("dsh-phone: TLS setup failed ({e}); serving plain HTTP");
+                serve_http(app, addr, rx).await;
+            }
+        }
+    } else {
+        serve_http(app, addr, rx).await;
+    }
+}
+
+async fn serve_http(
+    app: Router,
+    addr: SocketAddr,
+    mut rx: tokio::sync::mpsc::Receiver<()>,
+) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -296,9 +347,12 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
             return;
         }
     };
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = rx.recv().await;
-        })
-        .await;
+    let _ = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = rx.recv().await;
+    })
+    .await;
 }

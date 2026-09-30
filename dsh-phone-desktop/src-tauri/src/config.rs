@@ -23,6 +23,10 @@ pub struct AppConfig {
     pub max_attachment_bytes: u64,
     #[serde(default = "default_start_hidden")]
     pub start_hidden: bool,
+    #[serde(default)]
+    pub tls_enabled: bool,
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
 }
 
 fn default_bridge_endpoint() -> String {
@@ -118,6 +122,8 @@ impl AppConfig {
             event_buffer_max: 400,
             max_attachment_bytes: 50 * 1024 * 1024,
             start_hidden: false,
+            tls_enabled: false,
+            allowed_ips: Vec::new(),
         }
     }
 
@@ -145,6 +151,46 @@ impl AppConfig {
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(p, json).map_err(|e| e.to_string())
+    }
+
+    /// True when a connection from this peer IP should be accepted.
+    /// Empty allowlist = allow all. Loopback is always allowed. Supports exact
+    /// IPv4/IPv6 entries and IPv4 CIDR (e.g. "100.75.97.90" or "100.64.0.0/10").
+    pub fn allow_ip(&self, ip: std::net::IpAddr) -> bool {
+        if ip.is_loopback() || self.allowed_ips.is_empty() {
+            return true;
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let ip_u = u32::from_be_bytes(v4.octets());
+                for a in &self.allowed_ips {
+                    let a = a.trim();
+                    if a.is_empty() {
+                        continue;
+                    }
+                    if a == v4.to_string() {
+                        return true;
+                    }
+                    if let Some((base, bits)) = a.split_once('/') {
+                        if let (Ok(b), Ok(n)) =
+                            (base.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>())
+                        {
+                            if n <= 32 {
+                                let mask = if n == 0 { 0u32 } else { u32::MAX << (32 - n) };
+                                if (ip_u & mask) == (u32::from_be_bytes(b.octets()) & mask) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.to_string();
+                self.allowed_ips.iter().any(|a| a.trim() == s)
+            }
+        }
     }
 }
 
