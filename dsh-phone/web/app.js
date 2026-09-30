@@ -289,6 +289,45 @@ function isBookkeeping(it) {
   return it.type === "marker" || (it.type || "").indexOf("turn.") === 0;
 }
 
+let lastUserText = "";
+
+function computeLastUserText() {
+  let txt = "", best = -1;
+  for (const it of items.values()) {
+    const o = it.orderSeq || 0;
+    if (it.role === "user" && o > best) { best = o; txt = itemText(it)[1] || ""; }
+  }
+  lastUserText = txt;
+}
+
+function updateMsgactions() {
+  const el = $("msgactions");
+  if (!el) return;
+  el.classList.toggle("hidden", !(activeSession && lastUserText));
+  const rb = $("retry-btn");
+  if (rb) rb.classList.toggle("err", !!turnHadError);
+}
+
+function retryLast() {
+  if (!activeSession || !lastUserText) return;
+  turnHadError = false;
+  status("повтор хода…");
+  api("session.startTurn", { sessionId: activeSession, content: lastUserText }).then((r) => {
+    status(r.ok ? "повторяю, жду ответ…" : "ошибка: " + (r.error || "?"));
+    if (!r.ok) alert("ошибка: " + (r.error || "?"));
+  });
+}
+
+function editLast() {
+  if (!lastUserText) return;
+  const el = $("input");
+  el.value = lastUserText;
+  autoGrow();
+  el.focus();
+  el.selectionStart = el.selectionEnd = el.value.length;
+  status("правишь последнее сообщение");
+}
+
 function copyToClipboard(text) {
   return new Promise((resolve) => {
     const legacy = () => {
@@ -447,6 +486,8 @@ function fullRender() {
   const el = $("chat-items");
   rendered = new Set();
   nodeFor = new Map();
+  computeLastUserText();
+  updateMsgactions();
   const ordered = [...items.values()].sort((a, b) => (a.orderSeq || 0) - (b.orderSeq || 0)).filter((it) => !isBookkeeping(it));
   el.innerHTML = "";
   const frag = document.createDocumentFragment();
@@ -502,6 +543,8 @@ function mergeInto(list, isLive) {
     if (!have) { items.set(k, it); add.push(it); }
     else if ((have.revision || 0) !== (it.revision || 0)) { items.set(k, it); upd.push(it); }
   }
+  computeLastUserText();
+  updateMsgactions();
   if (!add.length && !upd.length) return;
   if (isLive && rendered.size) {
     const toAdd = add.filter((it) => !rendered.has(keyOf(it))).sort((a, b) => (a.orderSeq || 0) - (b.orderSeq || 0));
@@ -559,6 +602,7 @@ function applyState(st) {
     notifyNow("Нужен твой ответ", titleOf(activeSession) || "агент", "appr-" + activeSession);
   }
   checkApproval(st);
+  updateMsgactions();
 }
 
 function titleOf(sid) {
@@ -598,6 +642,9 @@ $("interrupt").onclick = () => {
   api("session.interrupt", { sessionId: activeSession });
   status("стоп запрошен");
 };
+
+$("retry-btn").onclick = retryLast;
+$("edit-btn").onclick = editLast;
 
 function checkApproval(state) {
   const el = $("approval");
