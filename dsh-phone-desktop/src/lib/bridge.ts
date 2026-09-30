@@ -10,6 +10,8 @@ export interface AppConfig {
   connector_id: string;
   created_at_unix: number;
   start_hidden?: boolean;
+  tls_enabled?: boolean;
+  allowed_ips?: string[];
 }
 
 export interface ServerStatus {
@@ -17,6 +19,7 @@ export interface ServerStatus {
   port: number;
   uptime_seconds: number;
   requests: number;
+  tls_sha256?: string | null;
 }
 
 export interface TailscaleStatus {
@@ -35,3 +38,5 @@ export const tailscaleInstall = (): Promise<string> => invoke("tailscale_install
 export const getAutostart = (): Promise<boolean> => invoke("get_autostart");
 export const setAutostart = (enabled: boolean): Promise<boolean> => invoke("set_autostart", { enabled });
 export const setStartHidden = (enabled: boolean): Promise<AppConfig> => invoke("set_start_hidden", { enabled });
+export const setTlsEnabled = (enabled: boolean): Promise<AppConfig> => invoke("set_tls_enabled", { enabled });
+export const setAllowedIps = (ips: string[]): Promise<AppConfig> => invoke("set_allowed_ips", { ips });

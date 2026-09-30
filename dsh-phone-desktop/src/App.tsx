@@ -13,6 +13,8 @@ import {
   getAutostart,
   setAutostart,
   setStartHidden,
+  setTlsEnabled,
+  setAllowedIps,
 } from "./lib/bridge";
 
 type Lang = "ru" | "en";
@@ -83,6 +85,16 @@ const dict: Record<Lang, Record<string, string>> = {
     startHiddenHint: "при запуске только значок в трее, без окна",
     startHiddenOn: "старт в трее включён",
     startHiddenOff: "старт с окном",
+    tls: "TLS поверх tailscale",
+    tlsHint: "самоподписанный серт, белый список IP, отсечка чужих даже в тейлнете · нужен рестарт узла",
+    tlsOn: "TLS включён",
+    tlsOff: "TLS выключен",
+    allowlist: "Белый список IP",
+    allowlistHint: "кто из тейлнета достучится. пусто = все. можно CIDR",
+    allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
+    allowlistApply: "применить",
+    allowlistSaved: "список сохранён",
+    fingerprint: "отпечаток серта",
   },
   en: {
     sub: "local bridge · phone ↔ PC",
@@ -149,6 +161,16 @@ const dict: Record<Lang, Record<string, string>> = {
     startHiddenHint: "only the tray icon on launch, no window",
     startHiddenOn: "tray start on",
     startHiddenOff: "window start on",
+    tls: "TLS over tailscale",
+    tlsHint: "self-signed cert, IP allowlist, drops strangers even inside the tailnet · node restart required",
+    tlsOn: "TLS on",
+    tlsOff: "TLS off",
+    allowlist: "IP allowlist",
+    allowlistHint: "who in the tailnet can reach it. empty = everyone. CIDR allowed",
+    allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
+    allowlistApply: "apply",
+    allowlistSaved: "allowlist saved",
+    fingerprint: "cert fingerprint",
   },
 };
 
@@ -297,6 +319,7 @@ export default function App() {
   const [tsBusy, setTsBusy] = useState(false);
   const [keyVisible, setKeyVisible] = useState(false);
   const [autostart, setAutostartState] = useState(false);
+  const [ipList, setIpList] = useState("");
   const [toast, setToast] = useState("");
   const [lang, setLang] = useState<Lang>(() =>
     localStorage.getItem("dsh-lang") === "en" ? "en" : "ru"
@@ -353,9 +376,34 @@ export default function App() {
     }
   };
 
+  const onToggleTls = async () => {
+    try {
+      const c = await setTlsEnabled(!(cfg?.tls_enabled));
+      setCfg(c);
+      fireToast(c.tls_enabled ? t("tlsOn") : t("tlsOff"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+  };
+
+  const onSaveAllowlist = async () => {
+    try {
+      const ips = ipList.split(",").map((s) => s.trim()).filter(Boolean);
+      const c = await setAllowedIps(ips);
+      setCfg(c);
+      setIpList((c.allowed_ips ?? []).join(", "));
+      fireToast(t("allowlistSaved"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+  };
+
   useEffect(() => {
     getConfig()
-      .then((c) => setCfg(c))
+      .then((c) => {
+        setCfg(c);
+        setIpList((c.allowed_ips ?? []).join(", "));
+      })
       .catch((e) => fireToast(t("errPrefix") + e));
     refreshTailscale();
     getAutostart().then(setAutostartState).catch(() => {});
@@ -681,6 +729,41 @@ export default function App() {
                   <button type="button" onClick={onToggleStartHidden} className={"toggle" + (cfg?.start_hidden ? " on" : "")} aria-pressed={!!cfg?.start_hidden}>
                     <span className="knob" />
                   </button>
+                </div>
+                <div className="flex items-center justify-between py-2.5 gap-3">
+                  <div>
+                    <div className="text-[13px] text-bone">{t("tls")}</div>
+                    <div className="text-[11.5px] text-ash">{t("tlsHint")}</div>
+                    {cfg?.tls_enabled && status?.tls_sha256 && (
+                      <div className="text-[11px] text-ash mt-1.5">
+                        {t("fingerprint")}{" "}
+                        <span className="mono-badge">{status.tls_sha256}</span>
+                      </div>
+                    )}
+                  </div>
+                  <button type="button" onClick={onToggleTls} className={"toggle" + (cfg?.tls_enabled ? " on" : "")} aria-pressed={!!cfg?.tls_enabled}>
+                    <span className="knob" />
+                  </button>
+                </div>
+                <div className="py-2.5">
+                  <div className="text-[13px] text-bone mb-0.5">{t("allowlist")}</div>
+                  <div className="text-[11.5px] text-ash mb-2">{t("allowlistHint")}</div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      value={ipList}
+                      onChange={(e) => setIpList(e.target.value)}
+                      placeholder={t("allowlistPlaceholder")}
+                      spellCheck={false}
+                      className="flex-1 min-w-0 bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                    />
+                    <button
+                      type="button"
+                      onClick={onSaveAllowlist}
+                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
+                    >
+                      {t("allowlistApply")}
+                    </button>
+                  </div>
                 </div>
               </div>
             </section>

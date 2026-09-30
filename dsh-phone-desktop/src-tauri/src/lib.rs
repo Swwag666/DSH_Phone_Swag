@@ -38,21 +38,25 @@ pub struct ServerStatus {
     pub port: u16,
     pub uptime_seconds: u64,
     pub requests: u64,
+    pub tls_sha256: Option<String>,
 }
 
 fn status_of(state: &ServerState) -> ServerStatus {
+    let tls_sha256 = crate::tls::cert_sha256();
     match state.running.lock().unwrap().as_ref() {
         Some(s) => ServerStatus {
             running: true,
             port: s.port,
             uptime_seconds: s.started_at.elapsed().as_secs(),
             requests: s.requests.load(Ordering::Relaxed),
+            tls_sha256,
         },
         None => ServerStatus {
             running: false,
             port: 8460,
             uptime_seconds: 0,
             requests: 0,
+            tls_sha256,
         },
     }
 }
