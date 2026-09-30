@@ -706,6 +706,14 @@ function twTick() {
 }
 
 function engageTw(node, key, target) {
+  if (tw.active && tw.key && tw.key !== key && tw.node && tw.node.isConnected) {
+    const oldIt = items.get(tw.key);
+    if (oldIt) {
+      const fresh = renderOne(oldIt);
+      tw.node.replaceWith(fresh);
+      nodeFor.set(tw.key, fresh);
+    }
+  }
   stopTw();
   tw.key = key;
   tw.node = node;
