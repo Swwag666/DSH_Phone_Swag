@@ -361,6 +361,16 @@ window.copyCode = function (btn) {
   });
 };
 
+window.toggleTool = function (head) {
+  const body = head.nextElementSibling;
+  if (!body) return;
+  const opening = body.hasAttribute("hidden");
+  if (opening) body.removeAttribute("hidden"); else body.setAttribute("hidden", "");
+  head.classList.toggle("open", opening);
+  const caret = head.querySelector(".toolc");
+  if (caret) caret.textContent = opening ? "▾" : "▸";
+};
+
 function highlightCode(code) {
   let s = escapeHtml(String(code == null ? "" : code));
   s = s.replace(/((?:&quot;|")[^"\n]*(?:&quot;|"))/g, '<span class="tk-str">$1</span>');
@@ -469,7 +479,14 @@ function itemHtml(it) {
   let cls = "msg ";
   let body;
   if (role === "user") { cls += "user"; body = escapeHtml(t[1] || "").replace(/\n/g, "<br>"); }
-  else if (t[0] === "tool") { cls += "tool"; body = escapeHtml(t[1] || "").replace(/\n/g, "<br>"); }
+  else if (t[0] === "tool") {
+    cls += "tool";
+    const raw = t[1] || "";
+    const nl = raw.indexOf("\n");
+    const title = nl >= 0 ? raw.slice(0, nl) : raw;
+    const rest = nl >= 0 ? raw.slice(nl + 1) : "";
+    body = `<div class="toolhead" onclick="toggleTool(this)"><span class="toolt">${escapeHtml(title)}</span><span class="toolc">▸</span></div><div class="toolbody" hidden>${escapeHtml(rest).replace(/\n/g, "<br>")}</div>`;
+  }
   else if (t[0] === "reasoning") { cls += "reasoning"; body = renderMarkdown(t[1]); }
   else if (role === "assistant") { cls += "assistant"; body = renderMarkdown(t[1]); }
   else { cls += "system"; body = escapeHtml(t[1] || "").replace(/\n/g, "<br>"); }
