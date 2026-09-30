@@ -198,6 +198,36 @@ button { cursor: pointer; font-family: inherit; }
 .msg code { background: #1a1a20; border: 1px solid #26262c; border-radius: 3px; padding: 1px 4px; font-family: inherit; }
 .msg a { color: #c9a1a1; }
 
+/* markdown */
+.msg h2, .msg h3, .msg h4 { margin: 8px 0 4px; color: #e8dcd3; line-height: 1.25; }
+.msg h2 { font-size: 15px; }
+.msg h3 { font-size: 14px; }
+.msg h4 { font-size: 13px; }
+.msg p { margin: 4px 0; }
+.msg code.ci { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+.msg strong { color: #e8dcd3; font-weight: 600; }
+.msg em { color: #cbb9b9; }
+.msg a { text-decoration: underline; }
+.msg hr { border: 0; border-top: 1px solid #26262c; margin: 8px 0; }
+.msg blockquote { margin: 6px 0; padding: 4px 10px; border-left: 2px solid #8a3838; color: #9a8a8a; }
+.msg ul, .msg ol { margin: 4px 0 4px 18px; padding: 0; }
+.msg li { margin: 2px 0; }
+.msg table { border-collapse: collapse; margin: 6px 0; font-size: 12.5px; display: block; overflow-x: auto; max-width: 100%; }
+.msg th, .msg td { border: 1px solid #26262c; padding: 3px 7px; }
+.msg th { background: #141419; color: #e8dcd3; }
+.codeblock { margin: 8px 0; border: 1px solid #1d1d23; border-radius: 4px; overflow: hidden; background: #0b0b0f; }
+.codehead { display: flex; justify-content: space-between; align-items: center; padding: 4px 10px; background: #141419; border-bottom: 1px solid #1d1d23; }
+.codelang { font-size: 11px; color: #6f6f75; text-transform: uppercase; letter-spacing: .08em; font-family: monospace; }
+.copycode { background: none; border: 1px solid #2a2a30; color: #9a8a8a; font-size: 11px; border-radius: 3px; padding: 2px 8px; cursor: pointer; }
+.copycode:hover { color: #e8dcd3; border-color: #8a3838; }
+.copycode.done { color: #5c7656; border-color: #5c7656; }
+.codeblock pre { margin: 0; padding: 10px; overflow-x: auto; }
+.codeblock code { background: none; border: 0; padding: 0; font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.5; white-space: pre; }
+.tk-str { color: #7ba075; }
+.tk-com { color: #5f5f66; font-style: italic; }
+.tk-num { color: #c98a8a; }
+.tk-kw { color: #b08ad6; }
+
 /* menu button in the top bar */
 #menu-btn { background: none; border: 0; color: #8a3838; font-size: 17px; padding: 2px 6px; }
 #menu-btn:active { color: #cfcec6; }
