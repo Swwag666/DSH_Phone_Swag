@@ -31,6 +31,42 @@ function markRead(sid, ts) {
   }
 }
 
+// typewriter только для свежих ходов, инициированных в этой сессии (не реплей при реконнекте)
+let allowTw = false;
+
+function histKey(sid) { return "dsh-phone-hist-" + sid; }
+function sessCacheKey() { return "dsh-phone-sessions"; }
+
+function saveHistory(sid, list) {
+  if (!sid || !Array.isArray(list) || !list.length) return;
+  try {
+    const slim = [...list].sort((a, b) => (a.orderSeq || 0) - (b.orderSeq || 0)).slice(-300);
+    localStorage.setItem(histKey(sid), JSON.stringify(slim));
+  } catch (_) {}
+}
+
+function loadCachedHistory(sid) {
+  try {
+    const raw = localStorage.getItem(histKey(sid));
+    if (!raw) return null;
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : null;
+  } catch (_) { return null; }
+}
+
+function saveSessionsCache(list) {
+  try { localStorage.setItem(sessCacheKey(), JSON.stringify((list || []).slice(0, 500))); } catch (_) {}
+}
+
+function loadCachedSessions() {
+  try {
+    const raw = localStorage.getItem(sessCacheKey());
+    if (!raw) return null;
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : null;
+  } catch (_) { return null; }
+}
+
 const $ = (id) => document.getElementById(id);
 
 function status(text) {
@@ -182,14 +218,22 @@ function openChat(s) {
   activeSession = s.sessionId;
   markRead(s.sessionId, orderTs(s));
   knownStatus = "";
+  allowTw = false;
   items = new Map();
   rendered = new Set();
   nodeFor = new Map();
   $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат") + " — загрузка…";
   show("view-chat");
   watch(activeSession, false);
+  const cached = loadCachedHistory(activeSession);
+  if (cached && cached.length) {
+    for (const it of cached) items.set(keyOf(it), it);
+    fullRender();
+    $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат") + " — из кэша…";
+  }
   loadFullHistory().then((list) => {
     for (const it of list) items.set(keyOf(it), it);
+    saveHistory(activeSession, list);
     fullRender();
     lastError = "";
     $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат");
@@ -311,6 +355,7 @@ function updateMsgactions() {
 function retryLast() {
   if (!activeSession || !lastUserText) return;
   turnHadError = false;
+  allowTw = true;
   status("повтор хода…");
   api("session.startTurn", { sessionId: activeSession, content: lastUserText }).then((r) => {
     status(r.ok ? "повторяю, жду ответ…" : "ошибка: " + (r.error || "?"));
@@ -677,7 +722,7 @@ function syncTypewriter() {
   const k = keyOf(it);
   const node = nodeFor.get(k);
   const txt = itemText(it)[1] || "";
-  if (isWorking(knownStatus) && node) {
+  if (allowTw && isWorking(knownStatus) && node) {
     if (tw.key !== k || !tw.active) engageTw(node, k, txt);
     else { tw.target = txt; tw.node = node; }
   } else if (tw.key === k && tw.active) {
@@ -736,6 +781,7 @@ $("composer").onsubmit = (e) => {
   $("input").value = "";
   autoGrow();
   turnHadError = false;
+  allowTw = true;
   const atts = pendingAttachments.slice();
   pendingAttachments = [];
   renderChips();
@@ -1057,7 +1103,7 @@ function refreshActiveChat() {
 
 function refreshSessions() {
   api("session.list", { limit: 1000 }).then((r) => {
-    if (r.ok) { sessions = r.result.sessions || []; renderSessions(); }
+    if (r.ok) { sessions = r.result.sessions || []; renderSessions(); saveSessionsCache(sessions); }
     else { lastError = "список сессий: " + (r.error || "?"); status(lastError); }
   }).catch((e) => { lastError = "список сессий: " + e.message; status(lastError); });
 }
@@ -1070,6 +1116,8 @@ async function boot() {
   if (window.caches && window.caches.keys) {
     window.caches.keys().then((ks) => ks.forEach((k) => window.caches.delete(k)));
   }
+  const cs = loadCachedSessions();
+  if (cs && cs.length) { sessions = cs; renderSessions(); }
   const h = await fetch("/api/health").then((r) => r.json()).catch(() => ({ ok: false, bridge: "disconnected" }));
   bridgeOn = h.bridge === "connected";
   $("status-dot").className = "dot " + (bridgeOn ? "on" : "off");
