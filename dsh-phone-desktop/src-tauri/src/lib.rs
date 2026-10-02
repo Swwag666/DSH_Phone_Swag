@@ -76,10 +76,19 @@ fn stop_inner(state: &ServerState) {
     };
     if let Some(s) = taken {
         let _ = s.shutdown.try_send(());
-        s.handle.abort();
-        for h in s.bg {
-            h.abort();
-        }
+        // Give the axum task a short window for graceful drain (in-flight
+        // requests finish, port releases), then hard-abort whatever is left.
+        // 300ms < restart_if_running's 400ms rebind pause, so the port is
+        // always free by the time do_start binds again.
+        let handle = s.handle;
+        let bg = s.bg;
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            handle.abort();
+            for h in bg {
+                h.abort();
+            }
+        });
     }
 }
 

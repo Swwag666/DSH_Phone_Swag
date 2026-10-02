@@ -16,6 +16,8 @@ URLs (phone, over Tailscale):
 import asyncio
 import base64
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -41,7 +43,51 @@ DEFAULT_CONFIG = {
         "~/.dsh/agents-anywhere/bridge/attachments/staging"
     ),
     "maxAttachmentBytes": 50 * 1024 * 1024,
+    "allowedIps": [],
 }
+
+# Request guard rails: header count/size and body size caps so a single
+# connection cannot balloon the process. 80 MiB mirrors the Rust node's
+# DefaultBodyLimit (base64 of a 50 MiB upload is ~67 MiB).
+MAX_HEADER_LINES = 100
+MAX_HEADER_BYTES = 64 * 1024
+MAX_BODY_BYTES = 80 * 1024 * 1024
+
+
+def token_ok(got, want):
+    """Constant-time token check; empty stored token never matches."""
+    if not want or not isinstance(got, str):
+        return False
+    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+
+
+def allow_ip(allowed, ip):
+    """Empty allowlist = allow all. Loopback is always allowed.
+    Entries: exact IPv4/IPv6 or CIDR (e.g. "100.75.97.90", "100.64.0.0/10")."""
+    if ip is None or ip.is_loopback:
+        return True
+    if not allowed:
+        return True
+    for entry in allowed:
+        e = str(entry).strip()
+        if not e:
+            continue
+        try:
+            if "/" in e:
+                if ip in ipaddress.ip_network(e, strict=False):
+                    return True
+            elif ip == ipaddress.ip_address(e):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+class BadHttpRequest(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 RPC_WHITELIST = {
     "ping",
@@ -379,8 +425,13 @@ class Gateway:
             return
         st = await self.bridge.request("session.getState", {"sessionId": sid}, timeout=15)
         w = self.watched[sid]
+        sel = st.get("selections") if isinstance(st.get("selections"), dict) else {}
         key = json.dumps(
-            [st.get("status"), st.get("selections", {}).get("model", {}).get("id", None) if isinstance(st.get("selections"), dict) else None],
+            [
+                st.get("status"),
+                (sel.get("model") or {}).get("id") if isinstance(sel.get("model"), dict) else None,
+                (sel.get("permission") or {}).get("id") if isinstance(sel.get("permission"), dict) else None,
+            ],
             ensure_ascii=False,
         )
         if key != w.get("lastStateKey"):
@@ -436,29 +487,44 @@ async def read_request_head(reader):
     first = await asyncio.wait_for(reader.readline(), 15)
     if not first:
         return None
+    if len(first) > MAX_HEADER_BYTES:
+        raise BadHttpRequest("431 Request Header Fields Too Large", "request line too large")
     parts = first.decode("latin-1").split()
     if len(parts) < 2:
         return None
     method, target = parts[0], parts[1]
     headers = {}
+    total_header_bytes = 0
+    header_count = 0
     while True:
         line = await asyncio.wait_for(reader.readline(), 15)
         if not line or line in (b"\r\n", b"\n"):
             break
+        header_count += 1
+        total_header_bytes += len(line)
+        if header_count > MAX_HEADER_LINES or total_header_bytes > MAX_HEADER_BYTES:
+            raise BadHttpRequest("431 Request Header Fields Too Large", "too many headers")
         k, _, v = line.decode("latin-1").partition(":")
         headers[k.strip().lower()] = v.strip()
-    length = int(headers.get("content-length", "0") or "0")
+    try:
+        length = int(headers.get("content-length", "0") or "0")
+    except ValueError:
+        raise BadHttpRequest("400 Bad Request", "bad content-length")
+    if length < 0:
+        raise BadHttpRequest("400 Bad Request", "bad content-length")
+    if length > MAX_BODY_BYTES:
+        raise BadHttpRequest("413 Payload Too Large", "body too large")
     body = b""
     if length:
-        body = await asyncio.wait_for(reader.readexactly(length), 15)
+        body = await asyncio.wait_for(reader.readexactly(length), 60)
     parsed = urlparse(target)
     return method, parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}, headers, body
 
 
 def serve_static(path):
     full = os.path.normpath(os.path.join(WEB, path.lstrip("/") or "index.html"))
-    if not full.startswith(WEB):
-        return _http_response(403, b"forbidden")
+    if not full.startswith(WEB + os.sep):
+        return _http_response("403 Forbidden", b"forbidden")
     if not os.path.isfile(full):
         full = os.path.join(WEB, "index.html")
     data = open(full, "rb").read()
@@ -469,7 +535,22 @@ def serve_static(path):
 
 async def handle_http(reader, writer, gw):
     try:
-        req = await read_request_head(reader)
+        peer = writer.get_extra_info("peername")
+        peer_ip = None
+        try:
+            peer_ip = ipaddress.ip_address(peer[0]) if peer else None
+        except ValueError:
+            peer_ip = None
+        if not allow_ip(gw.cfg.get("allowedIps") or [], peer_ip):
+            writer.write(_json("403 Forbidden", {"ok": False, "error": "ip_not_allowed"}))
+            await writer.drain()
+            return
+        try:
+            req = await read_request_head(reader)
+        except BadHttpRequest as exc:
+            writer.write(_json(exc.status, {"ok": False, "error": exc.message}))
+            await writer.drain()
+            return
         if req is None:
             writer.close()
             return
@@ -489,7 +570,6 @@ async def handle_http(reader, writer, gw):
                 )
             )
         elif method == "POST" and path == "/api/rpc":
-            tok = gw.cfg["gatewayToken"]
             try:
                 j = json.loads(body.decode("utf-8"))
             except Exception:
@@ -497,7 +577,7 @@ async def handle_http(reader, writer, gw):
                 await writer.drain()
                 writer.close()
                 return
-            if j.get("token") != tok or not tok:
+            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
                 writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
                 await writer.drain()
                 writer.close()
@@ -521,7 +601,7 @@ async def handle_http(reader, writer, gw):
         elif method == "GET" and path == "/api/events":
             j = json.loads(body.decode("utf-8")) if body else {}
             tok = q.get("token") or j.get("token")
-            if tok != gw.cfg["gatewayToken"] or not tok:
+            if not token_ok(tok, gw.cfg["gatewayToken"]):
                 writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
                 await writer.drain()
                 writer.close()
@@ -551,7 +631,7 @@ async def handle_http(reader, writer, gw):
                 j = json.loads(body.decode("utf-8"))
             except Exception:
                 j = {}
-            if j.get("token") != gw.cfg["gatewayToken"]:
+            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
                 writer.write(_json("401 Unauthorized", {"ok": False}))
                 await writer.drain()
                 writer.close()
@@ -572,7 +652,7 @@ async def handle_http(reader, writer, gw):
                 j = json.loads(body.decode("utf-8"))
             except Exception:
                 j = {}
-            if j.get("token") != gw.cfg["gatewayToken"] or not gw.cfg["gatewayToken"]:
+            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
                 writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
                 await writer.drain()
                 writer.close()

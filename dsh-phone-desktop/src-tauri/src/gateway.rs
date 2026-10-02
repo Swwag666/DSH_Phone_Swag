@@ -405,13 +405,19 @@ impl DeviceHub {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let model_id = stv
-            .get("selections")
-            .and_then(|s| s.get("model"))
-            .and_then(|m| m.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let key = format!("{status}|{model_id}");
+        let sel = stv.get("selections").and_then(|s| s.as_object());
+        let pick = |k: &str| -> String {
+            sel.and_then(|o| o.get(k))
+                .and_then(|m| m.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let key = format!(
+            "{status}|model={}|perm={}",
+            pick("model"),
+            pick("permission")
+        );
         let state_changed = {
             let mut st = self.state.lock().unwrap();
             match st.watched.get_mut(sid) {
@@ -466,7 +472,11 @@ impl DeviceHub {
                         }
                     }
                     if w.known_ids.len() > 2000 {
-                        let all: Vec<String> = w.known_ids.iter().cloned().collect();
+                        // Keep the lexicographically-largest half: ids are
+                        // monotonic-ish strings, so this retains the newest
+                        // items deterministically (client dedupes anyway).
+                        let mut all: Vec<String> = w.known_ids.iter().cloned().collect();
+                        all.sort_unstable();
                         let start = all.len().saturating_sub(1000);
                         w.known_ids = all.into_iter().skip(start).collect();
                     }
@@ -614,6 +624,21 @@ pub struct Gateway {
     hubs: Vec<Arc<DeviceHub>>,
 }
 
+/// Constant-time token comparison: no early exit on first mismatching byte,
+/// so a phone-side timing probe learns nothing about the stored token.
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let n = a.len().max(b.len());
+    let mut diff: u32 = (a.len() ^ b.len()) as u32;
+    for i in 0..n {
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as u32;
+    }
+    diff == 0
+}
+
 impl Gateway {
     pub fn new(
         cfg: std::sync::Arc<crate::config::AppConfig>,
@@ -657,7 +682,7 @@ impl Gateway {
 
     /// Hub that owns this access token (main or extra device).
     pub fn find_hub(&self, token: &str) -> Option<Arc<DeviceHub>> {
-        self.hubs.iter().find(|h| h.token == token).cloned()
+        self.hubs.iter().find(|h| token_eq(&h.token, token)).cloned()
     }
 
     pub fn main_hub(&self) -> &Arc<DeviceHub> {

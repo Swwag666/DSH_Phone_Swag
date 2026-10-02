@@ -443,7 +443,10 @@ function renderInline(s) {
   s = s.replace(/`([^`\n]+)`/g, '<code class="ci">$1</code>');
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+    if (!/^(https?:|mailto:|#|\/)/i.test(url)) return text;
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+  });
   return s;
 }
 
@@ -635,7 +638,9 @@ function mergeInto(list, isLive) {
 }
 
 function escapeHtml(s) {
-  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 }
 
 function nearBottom(el) {
@@ -1482,11 +1487,10 @@ function refreshSessions() {
 
 // ---------- boot ----------
 async function boot() {
+  // sw.js is network-first: it never serves a stale app shell, only acts as
+  // an offline fallback - so we keep it registered instead of tearing it down.
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.getRegistrations().then((rs) => rs.forEach((r) => r.unregister()));
-  }
-  if (window.caches && window.caches.keys) {
-    window.caches.keys().then((ks) => ks.forEach((k) => window.caches.delete(k)));
+    try { navigator.serviceWorker.register("/sw.js").catch(() => {}); } catch (_) {}
   }
   const cs = loadCachedSessions();
   if (cs && cs.length) { sessions = cs; renderSessions(); }

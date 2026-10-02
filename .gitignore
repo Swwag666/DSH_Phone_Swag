@@ -6,16 +6,19 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
-# Binaries
+# Binaries: distribution copies live in releases/ (see exceptions below)
 *.exe
-dsh-phone.exe
+!releases/*.exe
 
 # OS / editor clutter
 .DS_Store
 Thumbs.db
 *.log
 
-# secrets / local runtime config
+# local scratch / duplicates / secrets
 dsh-phone/config.json
 shot_*.png
 shots/
+
+__pycache__/
+*.pyc
