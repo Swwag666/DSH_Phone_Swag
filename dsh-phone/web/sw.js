@@ -1,5 +1,5 @@
-const CACHE = "dsh-phone-v14";
-const ASSETS = ["/", "/app.js", "/style.css", "/manifest.json", "/icon.svg"];
+const CACHE = "dsh-phone-v15";
+const ASSETS = ["/", "/app.js", "/md.js", "/style.css", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));

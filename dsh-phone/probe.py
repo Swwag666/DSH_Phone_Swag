@@ -19,12 +19,7 @@ async def main():
         "connectorId":"dsh-phone-gateway","sessionNamespace":"dsh-phone-gateway",
         "clientInfo":{"name":"dsh-phone-probe","version":"0.0.1"}}}, ensure_ascii=False, separators=(",",":"))+"\n").encode())
     await writer.drain()
-    buf = b""
-    def read_one():
-        nonlocal buf
-        while b"\n" not in buf:
-            pass
-    # simpler: read lines with timeout
+    # read lines with timeout
     async def readline(timeout=15):
         line = await asyncio.wait_for(reader.readline(), timeout)
         return json.loads(line)
