@@ -17,3 +17,5 @@ Thumbs.db
 
 # secrets / local runtime config
 dsh-phone/config.json
+shot_*.png
+shots/
