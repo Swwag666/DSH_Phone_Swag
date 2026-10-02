@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub tls_enabled: bool,
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+    #[serde(default = "default_staging_retention_secs")]
+    pub staging_retention_secs: u64,
     #[serde(default)]
     pub devices: Vec<DeviceEntry>,
     #[serde(default)]
@@ -75,7 +77,7 @@ fn default_bridge_endpoint() -> String {
         .to_string()
 }
 fn default_poll_seconds() -> f64 {
-    2.0
+    1.0
 }
 fn default_event_buffer_max() -> usize {
     400
@@ -85,6 +87,9 @@ fn default_max_attachment_bytes() -> u64 {
 }
 fn default_start_hidden() -> bool {
     false
+}
+fn default_staging_retention_secs() -> u64 {
+    7 * 86400
 }
 
 pub fn config_dir() -> PathBuf {
@@ -161,12 +166,13 @@ impl AppConfig {
             connector_id: "dsh-phone".to_string(),
             created_at_unix: now(),
             bridge_endpoint_path: default_bridge_endpoint(),
-            poll_seconds: 2.0,
+            poll_seconds: default_poll_seconds(),
             event_buffer_max: 400,
             max_attachment_bytes: 50 * 1024 * 1024,
             start_hidden: false,
             tls_enabled: false,
             allowed_ips: Vec::new(),
+            staging_retention_secs: default_staging_retention_secs(),
             devices: Vec::new(),
             vapid_keys: Some(crate::push::VapidKeys::generate()),
             push_subscriptions: Vec::new(),
@@ -190,6 +196,12 @@ impl AppConfig {
                         }
                         if c.ntfy_topic.is_none() {
                             c.ntfy_topic = Some(random_topic());
+                        }
+                        // миграция: старый дефолт 2.0 тормозил подхват чатов
+                        // на клиенте; поднимаем до 1.0, если юзер не выставил
+                        // своё значение ниже.
+                        if c.poll_seconds > 1.9 && c.poll_seconds <= 2.1 {
+                            c.poll_seconds = default_poll_seconds();
                         }
                         let _ = c.save();
                         return c;
@@ -260,6 +272,11 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
+    }
 
     #[test]
     fn gen_writes_file() {
@@ -270,5 +287,98 @@ mod tests {
         println!("token_len={} tailscale={}", c.token.len(), c.tailscale_ip);
         assert!(p.exists());
         assert_eq!(c.token.len(), 32);
+    }
+
+    #[test]
+    fn generated_defaults_have_staging_retention() {
+        let c = AppConfig::generate();
+        assert_eq!(c.staging_retention_secs, 7 * 86400);
+    }
+
+    #[test]
+    fn deserialising_old_config_gets_default_retention() {
+        let raw = serde_json::json!({
+            "config_path": "x.json",
+            "token": "0123456789abcdef0123456789abcdef",
+            "listen_host": "0.0.0.0",
+            "listen_port": 8460,
+            "staging_path": "stage",
+            "tailscale_ip": "127.0.0.1",
+            "connector_id": "dsh-phone",
+            "created_at_unix": 1,
+        });
+        let c: AppConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(c.staging_retention_secs, 7 * 86400);
+        assert!(c.allowed_ips.is_empty());
+    }
+
+    #[test]
+    fn allow_ip_loopback_always_allowed() {
+        let mut c = AppConfig::generate();
+        c.allowed_ips = vec!["10.0.0.1".to_string()];
+        assert!(c.allow_ip(v4("127.0.0.1")));
+        assert!(c.allow_ip(IpAddr::V6("::1".parse::<Ipv6Addr>().unwrap())));
+        assert!(!c.allow_ip(v4("10.0.0.5")));
+    }
+
+    #[test]
+    fn allow_ip_empty_list_allows_all() {
+        let c = AppConfig::generate();
+        assert!(c.allow_ip(v4("8.8.8.8")));
+    }
+
+    #[test]
+    fn allow_ip_exact_match() {
+        let mut c = AppConfig::generate();
+        c.allowed_ips = vec!["100.75.97.90".to_string()];
+        assert!(c.allow_ip(v4("100.75.97.90")));
+        assert!(!c.allow_ip(v4("100.75.97.91")));
+    }
+
+    #[test]
+    fn allow_ip_cidr() {
+        let mut c = AppConfig::generate();
+        c.allowed_ips = vec!["100.64.0.0/10".to_string()];
+        assert!(c.allow_ip(v4("100.64.0.0")));
+        assert!(c.allow_ip(v4("100.75.97.90")));
+        assert!(c.allow_ip(v4("100.127.255.255")));
+        // boundary: outside the CGNAT /10 tailnet range
+        assert!(!c.allow_ip(v4("100.128.0.1")));
+        assert!(!c.allow_ip(v4("100.63.255.255")));
+        assert!(!c.allow_ip(v4("101.0.0.1")));
+    }
+
+    #[test]
+    fn allow_ip_cidr_slash_zero_allows_everything() {
+        let mut c = AppConfig::generate();
+        c.allowed_ips = vec!["0.0.0.0/0".to_string()];
+        assert!(c.allow_ip(v4("1.2.3.4")));
+        assert!(c.allow_ip(v4("255.255.255.255")));
+    }
+
+    #[test]
+    fn allow_ip_garbage_entries_do_not_panic() {
+        let mut c = AppConfig::generate();
+        c.allowed_ips = vec![
+            "not-an-ip".to_string(),
+            "".to_string(),
+            "100.0.0.0/".to_string(),
+            "100.0.0.0/99".to_string(),
+        ];
+        assert!(!c.allow_ip(v4("100.1.2.3")));
+    }
+
+    #[test]
+    fn allow_ip_v6_exact() {
+        let mut c = AppConfig::generate();
+        // stored in expanded form, compared via normalised to_string()
+        c.allowed_ips = vec!["fd7a:115c:a1e0::1".to_string()];
+        assert!(c
+            .allow_ip(IpAddr::V6("fd7a:115c:a1e0::1".parse::<Ipv6Addr>().unwrap())));
+        // a different host is rejected
+        assert!(!c
+            .allow_ip(IpAddr::V6("fd7a:115c:a1e0::2".parse::<Ipv6Addr>().unwrap())));
+        assert!(!c
+            .allow_ip(IpAddr::V6("fd7a::1".parse::<Ipv6Addr>().unwrap())));
     }
 }

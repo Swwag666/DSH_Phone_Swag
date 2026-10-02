@@ -225,6 +225,8 @@ function openChat(s) {
   items = new Map();
   rendered = new Set();
   nodeFor = new Map();
+  noticeSig = "";
+  $("approval").innerHTML = "";
   $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат") + " — загрузка…";
   show("view-chat");
   watch(activeSession, false);
@@ -240,7 +242,7 @@ function openChat(s) {
     fullRender();
     lastError = "";
     $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат");
-    api("session.getState", { sessionId: activeSession }).then((rs) => { if (rs.ok) applyState(rs.result); });
+    refreshActiveChat();
   }).catch((e) => {
     lastError = "ошибка загрузки истории: " + e.message;
     status(lastError);
@@ -292,49 +294,8 @@ $("file-input").addEventListener("change", (e) => handleFiles(e.target.files));
 $("jumplast").onclick = () => scrollToBottom();
 
 // ---------- items ----------
-function keyOf(it) {
-  return it.id || ("k-" + (it.turnId || "") + "-" + (it.orderSeq ?? "") + "-" + (it.contentHash || ""));
-}
-
-function itemText(it) {
-  const c = it.content;
-  if (it.type === "tool" || (c && typeof c === "object" && (c.toolName || c.name || c.kind === "tool_use"))) {
-    const nm = (c && (c.toolName || c.name)) || it.toolName || it.name || "tool";
-    let out = nm + (it.status ? " · " + it.status : "");
-    let res = "";
-    if (c) {
-      if (typeof c.output === "string") res = c.output;
-      else if (Array.isArray(c.result)) res = c.result.map((o) => (o && typeof o.text === "string" ? o.text : "")).join(" ");
-      else if (typeof c.text === "string") res = c.text;
-    }
-    if (res) out += "\n" + res.slice(0, 2000);
-    return ["tool", out];
-  }
-  if (typeof c === "string") return ["markdown", c];
-  if (c && typeof c === "object") {
-    if (typeof c.text === "string") {
-      const kind = (c.kind === "reasoning" || c.kind === "thinking") ? "reasoning" : "markdown";
-      return [kind, c.text];
-    }
-    const blocks = Array.isArray(c) ? c : (c.blocks || c.parts || c.content || []);
-    if (Array.isArray(blocks)) {
-      const txt = blocks.map((b) => {
-        if (typeof b === "string") return b;
-        if (b && typeof b === "object" && typeof b.text === "string") return b.text;
-        if (b && typeof b === "object" && b.type === "text") return b.text || "";
-        return "";
-      }).filter(Boolean).join("\n");
-      if (txt) return ["markdown", txt];
-    }
-    return ["markdown", JSON.stringify(c)];
-  }
-  if (typeof it.text === "string") return ["markdown", it.text];
-  return ["markdown", JSON.stringify(it)];
-}
-
-function isBookkeeping(it) {
-  return it.type === "marker" || (it.type || "").indexOf("turn.") === 0;
-}
+// item parsing/rendering (itemText, itemHtml, toolCardHtml, keyOf, turn.end
+// helpers...) lives in itemrender.js - pure, unit-tested under node.
 
 let lastUserText = "";
 
@@ -423,130 +384,8 @@ window.toggleTool = function (head) {
   if (caret) caret.textContent = opening ? "▾" : "▸";
 };
 
-function highlightCode(code) {
-  let s = escapeHtml(String(code == null ? "" : code));
-  s = s.replace(/((?:&quot;|")[^"\n]*(?:&quot;|"))/g, '<span class="tk-str">$1</span>');
-  s = s.replace(/(\/\/[^\n]*)/g, '<span class="tk-com">$1</span>');
-  s = s.replace(/(\/\*[\s\S]*?\*\/)/g, '<span class="tk-com">$1</span>');
-  s = s.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="tk-num">$1</span>');
-  s = s.replace(/\b(fn|function|const|let|var|return|if|else|for|while|loop|match|import|from|export|async|await|def|class|new|try|catch|throw|use|pub|struct|impl|trait|self|Some|None|Ok|Err|true|false|null|undefined|typeof|static|mut|print)\b/g, '<span class="tk-kw">$1</span>');
-  return s;
-}
-
-function renderCodeBlock(code, lang) {
-  const label = escapeHtml(lang && lang.trim() || "code");
-  return `<div class="codeblock"><div class="codehead"><span class="codelang">${label}</span><button class="copycode" type="button" onclick="copyCode(this)">копия</button></div><pre><code>${highlightCode(code)}</code></pre></div>`;
-}
-
-function renderInline(s) {
-  // input assumed already HTML-escaped
-  s = s.replace(/`([^`\n]+)`/g, '<code class="ci">$1</code>');
-  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-  s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
-    if (!/^(https?:|mailto:|#|\/)/i.test(url)) return text;
-    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`;
-  });
-  return s;
-}
-
-function renderTableHtml(rows) {
-  const parse = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-  const header = parse(rows[0]);
-  const body = rows.slice(1).filter((r) => !/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(r));
-  let html = "<table><thead><tr>" + header.map((c) => "<th>" + renderInline(escapeHtml(c)) + "</th>").join("") + "</tr></thead><tbody>";
-  for (const r of body) {
-    const cells = parse(r);
-    html += "<tr>" + header.map((_, i) => "<td>" + renderInline(escapeHtml(cells[i] || "")) + "</td>").join("") + "</tr>";
-  }
-  return html + "</tbody></table>";
-}
-
-function renderMarkdown(src) {
-  const blocks = [];
-  let input = String(src == null ? "" : src);
-  input = input.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
-    const i = blocks.length;
-    blocks.push({ lang: lang.trim(), code });
-    return "\u0000B" + i + "\u0000";
-  });
-
-  const lines = input.split("\n");
-  const out = [];
-  let inList = null;
-  let tableRows = [];
-  let para = [];
-
-  const flushPara = () => { if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; } };
-  const closeList = () => { if (inList) { out.push("</" + inList + ">"); inList = null; } };
-  const flushTable = () => {
-    if (tableRows.length >= 2) out.push(renderTableHtml(tableRows));
-    else if (tableRows.length) out.push("<p>" + tableRows.map((r) => renderInline(escapeHtml(r))).join("<br>") + "</p>");
-    tableRows = [];
-  };
-
-  for (const raw of lines) {
-    const line = raw;
-    if (/^\u0000B\d+\u0000$/.test(line)) { flushPara(); closeList(); flushTable(); out.push(line); continue; }
-    if (/^\s*\|.*\|\s*$/.test(line)) { flushPara(); closeList(); tableRows.push(line); continue; }
-    if (tableRows.length) flushTable();
-    if (/^\s*$/.test(line)) { flushPara(); closeList(); continue; }
-    let m = line.match(/^(#{1,4})\s+(.*)$/);
-    if (m) {
-      flushPara(); closeList();
-      const lvl = Math.min(m[1].length + 1, 4);
-      out.push("<h" + lvl + ">" + renderInline(escapeHtml(m[2])) + "</h" + lvl + ">");
-      continue;
-    }
-    if (/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { flushPara(); closeList(); out.push("<hr>"); continue; }
-    if (/^>\s?/.test(line)) {
-      flushPara(); closeList();
-      out.push("<blockquote>" + renderInline(escapeHtml(line.replace(/^>\s?/, ""))) + "</blockquote>");
-      continue;
-    }
-    m = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (m) {
-      flushPara();
-      if (inList !== "ul") { closeList(); out.push("<ul>"); inList = "ul"; }
-      out.push("<li>" + renderInline(escapeHtml(m[1])) + "</li>");
-      continue;
-    }
-    m = line.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (m) {
-      flushPara();
-      if (inList !== "ol") { closeList(); out.push("<ol>"); inList = "ol"; }
-      out.push("<li>" + renderInline(escapeHtml(m[1])) + "</li>");
-      continue;
-    }
-    closeList();
-    para.push(renderInline(escapeHtml(line)));
-  }
-  flushPara(); closeList(); flushTable();
-
-  let html = out.join("\n");
-  html = html.replace(/\u0000B(\d+)\u0000/g, (m, i) => renderCodeBlock(blocks[+i].code, blocks[+i].lang));
-  return html;
-}
-
-function itemHtml(it) {
-  const role = it.role || "system";
-  const t = itemText(it);
-  let cls = "msg ";
-  let body;
-  if (role === "user") { cls += "user"; body = escapeHtml(t[1] || "").replace(/\n/g, "<br>"); }
-  else if (t[0] === "tool") {
-    cls += "tool";
-    const raw = t[1] || "";
-    const nl = raw.indexOf("\n");
-    const title = nl >= 0 ? raw.slice(0, nl) : raw;
-    const rest = nl >= 0 ? raw.slice(nl + 1) : "";
-    body = `<div class="toolhead" onclick="toggleTool(this)"><span class="toolt">${escapeHtml(title)}</span><span class="toolc">▸</span></div><div class="toolbody" hidden>${escapeHtml(rest).replace(/\n/g, "<br>")}</div>`;
-  }
-  else if (t[0] === "reasoning") { cls += "reasoning"; body = renderMarkdown(t[1]); }
-  else if (role === "assistant") { cls += "assistant"; body = renderMarkdown(t[1]); }
-  else { cls += "system"; body = escapeHtml(t[1] || "").replace(/\n/g, "<br>"); }
-  return `<div class="${cls}">${body}</div>`;
-}
+// ---------- markdown/escaping live in md.js (pure, unit-tested there) ----------
+// tool cards / reasoning / turn.end chips live in itemrender.js (pure too) ----------
 
 function renderOne(it) {
   const tmp = document.createElement("div");
@@ -567,6 +406,7 @@ function fullRender() {
   const frag = document.createDocumentFragment();
   for (const it of ordered) {
     const node = renderOne(it);
+    if (!node) continue;
     frag.appendChild(node);
     rendered.add(keyOf(it));
     nodeFor.set(keyOf(it), node);
@@ -589,6 +429,7 @@ function appendDom(arr) {
   const frag = document.createDocumentFragment();
   for (const it of arr) {
     const node = renderOne(it);
+    if (!node) { rendered.add(keyOf(it)); continue; }
     frag.appendChild(node);
     rendered.add(keyOf(it));
     nodeFor.set(keyOf(it), node);
@@ -602,7 +443,11 @@ function appendDom(arr) {
 function replaceDom(it) {
   const k = keyOf(it);
   const old = nodeFor.get(k);
-  if (!old) { fullRender(); return; }
+  if (!old) {
+    if (isBookkeeping(it) || (isTurnEnd(it) && !itemText(it)[1])) return;
+    fullRender();
+    return;
+  }
   const el = $("chat-items");
   const stick = nearBottom(el);
   if (tw.active && tw.key === k) {
@@ -611,6 +456,7 @@ function replaceDom(it) {
     return;
   }
   const node = renderOne(it);
+  if (!node) { old.remove(); nodeFor.delete(k); return; }
   old.replaceWith(node);
   nodeFor.set(k, node);
   if (stick) el.scrollTop = el.scrollHeight;
@@ -625,6 +471,7 @@ function mergeInto(list, isLive) {
     if (!have) { items.set(k, it); add.push(it); }
     else if ((have.revision || 0) !== (it.revision || 0)) { items.set(k, it); upd.push(it); }
   }
+  for (const it of add) { if (isErrorItem(it) || isTurnError(it)) turnHadError = true; }
   computeLastUserText();
   updateMsgactions();
   if (!add.length && !upd.length) return;
@@ -635,12 +482,6 @@ function mergeInto(list, isLive) {
   } else {
     fullRender();
   }
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
 }
 
 function nearBottom(el) {
@@ -670,7 +511,17 @@ function stopTw() {
 function lastAssistantItem() {
   let best = null, bo = -1;
   for (const it of items.values()) {
-    if (it.role !== "assistant") continue;
+    if (it.role !== "assistant" || (it.type && it.type !== "message")) continue;
+    const o = it.orderSeq || 0;
+    if (o > bo) { bo = o; best = it; }
+  }
+  return best;
+}
+
+function lastTurnEndItem() {
+  let best = null, bo = -1;
+  for (const it of items.values()) {
+    if (!isTurnEnd(it)) continue;
     const o = it.orderSeq || 0;
     if (o > bo) { bo = o; best = it; }
   }
@@ -833,32 +684,180 @@ $("interrupt").onclick = () => {
 $("retry-btn").onclick = retryLast;
 $("edit-btn").onclick = editLast;
 
+// ---------- notices / questions ----------
+let noticeSig = "";
+
+function noticeFormSpec(n) {
+  if (n.input && Array.isArray(n.input.questions)) return n.input;
+  if (n.form && Array.isArray(n.form.questions)) return n.form;
+  const acts = n.actions || [];
+  for (const a of acts) {
+    if (a && a.input && Array.isArray(a.input.questions)) return a.input;
+  }
+  return null;
+}
+
+function noticeActionOf(n, want) {
+  const acts = n.actions || [];
+  for (const a of acts) {
+    const aid = a.actionId || a.id || a.name || "";
+    if (aid === want) return { actionId: aid, input: a.input || null };
+  }
+  return { actionId: want, input: null };
+}
+
+function submitNotice(nid, actionId, inputData) {
+  const params = { sessionId: activeSession, noticeId: nid, actionId: actionId };
+  if (inputData) params.inputData = inputData;
+  status(actionId === "submit" || actionId === "approve" ? "отправляю ответ…" : "отменяю запрос…");
+  api("session.respondInteraction", params).then((r) => {
+    if (r.ok) {
+      status("ответ ушёл");
+      $("approval").innerHTML = "";
+      noticeSig = "";
+      setTimeout(() => { if (activeSession) refreshActiveChat(); }, 500);
+    } else {
+      status("ответ не прошёл: " + (r.error || "?"));
+      setTimeout(() => { if (activeSession) refreshActiveChat(); }, 800);
+    }
+  }).catch((e) => { status("ответ не прошёл: " + e.message); });
+}
+
+function questionHtml(q) {
+  const prompt = String(q.prompt || q.question || "");
+  const header = q.header ? `<div class="qh">${escapeHtml(q.header)}</div>` : "";
+  const multi = !!q.multiple;
+  const opts = Array.isArray(q.options) ? q.options : [];
+  let h = `<div class="qq" data-qid="${escapeHtml(q.id)}">` + header + `<div class="qp">${escapeHtml(prompt)}</div><div class="qq-opts">`;
+  for (const o of opts) {
+    h += `<div class="qopt" data-oid="${escapeHtml(o.id)}" role="${multi ? "checkbox" : "radio"}" tabindex="0">` +
+      `<span class="qo-mark"></span><span class="qo-body"><span class="qo-label">${escapeHtml(o.label)}</span>` +
+      (o.description ? `<span class="qo-desc">${escapeHtml(o.description)}</span>` : "") +
+      `</span></div>`;
+  }
+  h += `</div>`;
+  if (q.allowCustom) h += `<input class="qcustom" type="text" placeholder="свой ответ…" autocomplete="off" />`;
+  h += `</div>`;
+  return h;
+}
+
+function noticeCard(n) {
+  const nid = n.noticeId || n.id || "";
+  const wrap = document.createElement("div");
+  wrap.className = "notice";
+  const title = n.title || n.question || n.text || "Нужен ответ";
+  const sub = n.message || "";
+  const spec = noticeFormSpec(n);
+  let html = `<div class="q">${escapeHtml(title)}</div>`;
+  if (sub) html += `<div class="q-sub">${escapeHtml(sub)}</div>`;
+  const answers = {};
+  if (spec && spec.questions.length) {
+    for (const q of spec.questions) {
+      answers[q.id] = { optionIds: new Set(), custom: "" };
+      html += questionHtml(q);
+    }
+    const submitA = noticeActionOf(n, "submit");
+    const cancelA = noticeActionOf(n, "cancel");
+    html += `<div class="notice-actions">` +
+      `<button class="btn primary" data-nid="${escapeHtml(nid)}" data-aid="${escapeHtml(submitA.actionId)}">ответить</button>` +
+      (cancelA ? `<button class="btn" data-nid="${escapeHtml(nid)}" data-aid="${escapeHtml(cancelA.actionId)}">отменить</button>` : "") +
+      `</div>`;
+  } else {
+    const acts = (n.actions || []).filter((a) => a && (a.actionId || a.id || a.name));
+    if (!acts.length) return wrap;
+    html += `<div class="notice-actions">` + acts.map((a) => {
+      const aid = a.actionId || a.id || a.name || "";
+      const lbl = a.label || a.title || a.name || aid;
+      return `<button class="btn${a.style === "primary" ? " primary" : ""}" data-nid="${escapeHtml(nid)}" data-aid="${escapeHtml(aid)}">${escapeHtml(lbl)}</button>`;
+    }).join("") + `</div>`;
+  }
+  wrap.innerHTML = html;
+
+  for (const qEl of wrap.querySelectorAll(".qq")) {
+    const qid = qEl.getAttribute("data-qid");
+    const qspec = spec && spec.questions.find((x) => x.id === qid);
+    const isMulti = !!(qspec && qspec.multiple);
+    qEl.querySelectorAll(".qopt").forEach((opt) => {
+      const pick = () => {
+        const oid = opt.getAttribute("data-oid");
+        const a = answers[qid];
+        if (isMulti) {
+          const on = opt.classList.toggle("on");
+          if (on) a.optionIds.add(oid); else a.optionIds.delete(oid);
+        } else {
+          qEl.querySelectorAll(".qopt").forEach((o) => o.classList.remove("on"));
+          opt.classList.add("on");
+          a.optionIds.clear();
+          a.optionIds.add(oid);
+        }
+      };
+      opt.onclick = pick;
+      opt.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } };
+    });
+    const custom = qEl.querySelector(".qcustom");
+    if (custom) {
+      custom.oninput = () => { answers[qid].custom = custom.value; };
+    }
+  }
+
+  wrap.querySelectorAll(".notice-actions .btn").forEach((b) => {
+    b.onclick = () => {
+      const aid = b.getAttribute("data-aid");
+      if (spec && spec.questions.length && (aid === "submit")) {
+        const inputData = { answers: {} };
+        let missing = false;
+        for (const q of spec.questions) {
+          const a = answers[q.id] || { optionIds: new Set(), custom: "" };
+          const optionIds = [...a.optionIds];
+          let customText = (a.custom || "").trim();
+          if (!q.multiple) {
+            if (optionIds.length > 1) optionIds.length = 1;
+            if (optionIds.length && customText) customText = "";
+          }
+          const answered = optionIds.length > 0 || customText.length > 0;
+          if (!answered && q.required !== false) {
+            missing = true;
+            const qEl = wrap.querySelector(`.qq[data-qid="${CSS.escape(q.id)}"]`);
+            if (qEl) {
+              qEl.classList.add("miss");
+              setTimeout(() => qEl.classList.remove("miss"), 1600);
+            }
+          }
+          inputData.answers[q.id] = { optionIds: optionIds, customText: customText };
+        }
+        if (missing) { status("ответь на обязательные вопросы"); return; }
+        submitNotice(b.getAttribute("data-nid"), aid, inputData);
+      } else {
+        submitNotice(b.getAttribute("data-nid"), aid, undefined);
+      }
+    };
+  });
+  return wrap;
+}
+
 function checkApproval(state) {
   const el = $("approval");
-  const waiting = state && ["waiting_approval", "waiting", "blocked", "pending"].indexOf(state.status) >= 0;
-  if (!waiting || !activeSession) { el.innerHTML = ""; return; }
+  const waiting = state && ["waiting_approval", "waiting", "blocked", "pending", "asking"].indexOf(state.status) >= 0;
+  if (!waiting || !activeSession) { el.innerHTML = ""; noticeSig = ""; return; }
   api("session.getNotices", { sessionId: activeSession }).then((r) => {
-    const ns = (r.ok && r.result && r.result.notices) || [];
-    if (!ns.length) { el.innerHTML = ""; return; }
-    el.innerHTML = ns.map((n) => {
-      const acts = (n.actions || n.actionCandidates || []).map((a) => {
-        const aid = a.actionId || a.id || a.name || "";
-        const lbl = a.label || a.title || a.name || aid || "ok";
-        return `<button class="btn" data-nid="${escapeHtml(n.noticeId || n.id || "")}" data-aid="${escapeHtml(aid)}">${escapeHtml(lbl)}</button>`;
-      }).join(" ");
-      const q = n.title || n.question || n.text || "Нужен ответ";
-      const sub = n.message ? `<div class="q-sub">${escapeHtml(n.message)}</div>` : "";
-      return `<div class="notice">${sub}<div class="q">${escapeHtml(q)}</div>${acts}</div>`;
-    }).join("");
-    el.querySelectorAll("button[data-aid]").forEach((b) => {
-      b.onclick = () => {
-        api("session.respondInteraction", {
-          sessionId: activeSession,
-          noticeId: b.getAttribute("data-nid"),
-          actionId: b.getAttribute("data-aid"),
-        });
-      };
+    if (!activeSession) return;
+    const ns = ((r.ok && r.result && r.result.notices) || []).filter((n) => {
+      const st = n.status || "open";
+      return st === "open" || st === "pending";
     });
+    if (!ns.length) {
+      if (el.innerHTML) { el.innerHTML = ""; noticeSig = ""; }
+      return;
+    }
+    const sig = ns.map((n) => (n.noticeId || n.id) + ":" + (n.revision || 0)).join("|");
+    if (sig === noticeSig) return;
+    noticeSig = sig;
+    for (const n of ns) {
+      const nid = n.noticeId || n.id;
+      if (nid) notifyNow("Нужен твой ответ", (n.title || titleOf(activeSession) || "агент").slice(0, 120), "notice-" + nid);
+    }
+    el.innerHTML = "";
+    for (const n of ns) el.appendChild(noticeCard(n));
   }).catch(() => {});
 }
 
@@ -1535,7 +1534,7 @@ function processEvent(ev) {
   else if (ev.type === "state" && ev.data.sessionId === activeSession) { applyState(ev.data.state); }
   else if (ev.type === "items" && ev.data.sessionId === activeSession) {
     mergeInto(ev.data.items, true);
-    for (const it of ev.data.items || []) { if (isErrorItem(it)) turnHadError = true; }
+    for (const it of ev.data.items || []) { if (isErrorItem(it) || isTurnError(it)) turnHadError = true; }
   }
   else if (ev.type === "turnEnded") {
     const sid = ev.data && ev.data.sessionId;
@@ -1547,33 +1546,57 @@ function processEvent(ev) {
     }
     const isActive = sid === activeSession;
     const err = isActive && turnHadError;
-    notifyNow(err ? "Работа не закончена" : "Работа закончена", titleOf(sid) || "агент", "turn-" + (sid || "x"));
-    if (isActive) turnHadError = false;
+    let extra = "";
+    if (err) {
+      const te = lastTurnEndItem();
+      if (te) { const info = turnEndInfo(te); if (info.msg) extra = info.msg.slice(0, 160); }
+    }
+    notifyNow(err ? "Работа не закончена" : "Работа закончена", extra || titleOf(sid) || "агент", "turn-" + (sid || "x"));
+    if (isActive) {
+      turnHadError = false;
+      setTimeout(() => { if (activeSession === sid) refreshActiveChat(); }, 300);
+    }
   }
 }
 
 async function pollLoop() {
+  let got = 0, failed = false;
   try {
-    const r = await fetch(`/api/events?token=${encodeURIComponent(token)}&since=${since}&had=1`).then((x) => x.json());
+    const r = await fetch(`/api/events?since=${since}&had=1`, {
+      headers: { "X-Dsh-Token": token },
+    }).then((x) => x.json());
     since = r.ts;
-    (r.events || []).forEach(processEvent);
+    const evs = r.events || [];
+    evs.forEach(processEvent);
+    got = evs.length;
     lastError = "";
   } catch (e) {
     lastError = "события: " + e.message;
+    failed = true;
   }
   if (activeSession) status(bridgeOn ? (isWorking(knownStatus) ? "агент работает…" : (knownStatus === "waiting_approval" ? "ждёт ответа…" : (knownStatus && knownStatus !== "idle" ? knownStatus : "чат"))) : "мост отключён" + (lastError ? " · " + lastError : ""));
-  pollTimer = setTimeout(pollLoop, 900);
+  const delay = failed ? 2500 : (got ? 60 : 900);
+  pollTimer = setTimeout(pollLoop, delay);
 }
 
 function startPolling() { if (!pollTimer) pollLoop(); }
 
-function startRefreshTimer() {
+function scheduleRefresh() {
   if (refreshTimer) return;
-  refreshTimer = setInterval(() => {
-    if (!activeSession) { refreshSessions(); return; }
-    refreshActiveChat();
-  }, 5000);
+  const busy = activeSession && (isWorking(knownStatus) || knownStatus === "waiting_approval" || knownStatus === "asking");
+  const delay = busy ? 2500 : 7000;
+  refreshTimer = setTimeout(() => {
+    refreshTimer = null;
+    try {
+      if (!activeSession) refreshSessions();
+      else refreshActiveChat();
+    } finally {
+      scheduleRefresh();
+    }
+  }, delay);
 }
+
+function startRefreshTimer() { scheduleRefresh(); }
 
 function refreshActiveChat() {
   if (!activeSession) return;

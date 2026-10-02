@@ -19,6 +19,7 @@ Thumbs.db
 dsh-phone/config.json
 shot_*.png
 shots/
+releases/dsh-phone-old.exe
 
 __pycache__/
 *.pyc

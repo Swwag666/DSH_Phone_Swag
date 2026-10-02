@@ -1,7 +1,7 @@
 [package]
 name = "dsh-phone"
-version = "0.2.0"
-description = "DSH Phone - локальный мост между DSH Desktop и телефоном"
+version = "0.3.0"
+description = "DSH Phone - Ð»Ð¾ÐºÐ°Ð»ÑŒÐ½Ñ‹Ð¹ Ð¼Ð¾ÑÑ‚ Ð¼ÐµÐ¶Ð´Ñƒ DSH Desktop Ð¸ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð¾Ð¼"
 authors = ["Rustvy"]
 edition = "2021"
 rust-version = "1.77"

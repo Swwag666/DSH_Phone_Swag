@@ -11,6 +11,13 @@ URLs (phone, over Tailscale):
   GET  /api/health           liveness + bridge status
   POST /api/rpc              {token,method,params} -> whitelisted bridge call
   GET  /api/events?since=..  long-poll: {ts, events:[...]} (token required)
+
+Auth: the token rides in the JSON body (/api/rpc, /api/watch, /api/upload) or,
+preferred, in the X-Dsh-Token header on any endpoint - the header form keeps
+the key out of query strings, proxies and browser history.
+
+The connection layer speaks HTTP/1.1 keep-alive (honouring Connection headers),
+Content-Length and chunked request bodies, and `Expect: 100-continue`.
 """
 
 import asyncio
@@ -37,12 +44,13 @@ DEFAULT_CONFIG = {
         "~/.dsh/agents-anywhere/bridge/endpoint.json"
     ),
     "connectorId": "dsh-phone-gateway",
-    "pollSeconds": 2.0,
+    "pollSeconds": 1.0,
     "eventBufferMax": 400,
     "attachmentStagingPath": os.path.expanduser(
         "~/.dsh/agents-anywhere/bridge/attachments/staging"
     ),
     "maxAttachmentBytes": 50 * 1024 * 1024,
+    "stagingRetentionSecs": 7 * 86400,
     "allowedIps": [],
     "ntfyEnabled": False,
     "ntfyUrl": "",
@@ -56,6 +64,12 @@ DEFAULT_CONFIG = {
 MAX_HEADER_LINES = 100
 MAX_HEADER_BYTES = 64 * 1024
 MAX_BODY_BYTES = 80 * 1024 * 1024
+# Keep-alive guard rails: cap requests per connection (re-cycle), and close
+# the connection after too many failed token attempts (anti-hammering).
+MAX_REQS_PER_CONN = 1000
+AUTH_FAILURES_LIMIT = 10
+# Preferred auth header; the JSON body / query form stays as a fallback.
+TOKEN_HEADER = "x-dsh-token"
 
 
 def token_ok(got, want):
@@ -120,6 +134,7 @@ def ntfy_send(cfg, title, body):
         urllib.request.urlopen(req, timeout=15).read()
     except Exception:
         pass
+
 
 RPC_WHITELIST = {
     "ping",
@@ -520,11 +535,11 @@ class Gateway:
         self.watched.pop(sid, None)
 
 
-def _http_response(status, body_bytes, ctype="application/json; charset=utf-8", extra=None):
+def _http_response(status, body_bytes, ctype="application/json; charset=utf-8", extra=None, keep=False):
     headers = {
         "Content-Type": ctype,
         "Content-Length": str(len(body_bytes)),
-        "Connection": "close",
+        "Connection": "keep-alive" if keep else "close",
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "no-store",
     }
@@ -534,12 +549,51 @@ def _http_response(status, body_bytes, ctype="application/json; charset=utf-8", 
     return head.encode("latin-1") + body_bytes
 
 
-def _json(status, obj):
-    return _http_response(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+def _json(status, obj, keep=False):
+    return _http_response(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), keep=keep)
 
 
-async def read_request_head(reader):
-    # returns (method, path, query_dict, headers, body)
+async def read_chunked(reader):
+    """Decode a chunked request body, enforcing the global body-size cap."""
+    body = bytearray()
+    while True:
+        line = await asyncio.wait_for(reader.readline(), 15)
+        if not line:
+            raise BadHttpRequest("400 Bad Request", "truncated chunked body")
+        raw = line.split(b";")[0].strip()
+        if not raw:
+            raise BadHttpRequest("400 Bad Request", "bad chunk size")
+        try:
+            size = int(raw, 16)
+        except ValueError:
+            raise BadHttpRequest("400 Bad Request", "bad chunk size")
+        if size == 0:
+            # trailers until the blank line (we read and discard them)
+            while True:
+                t = await asyncio.wait_for(reader.readline(), 15)
+                if not t or t in (b"\r\n", b"\n"):
+                    break
+            return bytes(body)
+        if len(body) + size > MAX_BODY_BYTES:
+            raise BadHttpRequest("413 Payload Too Large", "body too large")
+        body += await asyncio.wait_for(reader.readexactly(size), 60)
+        # chunk data is followed by CRLF (lenient about a lone LF)
+        term = await asyncio.wait_for(reader.readexactly(1), 15)
+        if term == b"\r":
+            term2 = await asyncio.wait_for(reader.readexactly(1), 15)
+            if term2 != b"\n":
+                raise BadHttpRequest("400 Bad Request", "bad chunk terminator")
+        elif term != b"\n":
+            raise BadHttpRequest("400 Bad Request", "bad chunk terminator")
+
+
+async def read_request_head(reader, writer=None):
+    """Parse one request off the wire.
+
+    Returns (method, path, query, headers, body, keep_alive) or None on a clean
+    EOF. Raises BadHttpRequest (status + message) on protocol garbage.
+    keep_alive follows HTTP/1.1 semantics plus the Connection header.
+    """
     first = await asyncio.wait_for(reader.readline(), 15)
     if not first:
         return None
@@ -549,9 +603,11 @@ async def read_request_head(reader):
     if len(parts) < 2:
         return None
     method, target = parts[0], parts[1]
+    version = parts[2] if len(parts) > 2 else "HTTP/1.0"
     headers = {}
     total_header_bytes = 0
     header_count = 0
+    last_key = None
     while True:
         line = await asyncio.wait_for(reader.readline(), 15)
         if not line or line in (b"\r\n", b"\n"):
@@ -560,24 +616,57 @@ async def read_request_head(reader):
         total_header_bytes += len(line)
         if header_count > MAX_HEADER_LINES or total_header_bytes > MAX_HEADER_BYTES:
             raise BadHttpRequest("431 Request Header Fields Too Large", "too many headers")
-        k, _, v = line.decode("latin-1").partition(":")
-        headers[k.strip().lower()] = v.strip()
-    try:
-        length = int(headers.get("content-length", "0") or "0")
-    except ValueError:
-        raise BadHttpRequest("400 Bad Request", "bad content-length")
-    if length < 0:
-        raise BadHttpRequest("400 Bad Request", "bad content-length")
-    if length > MAX_BODY_BYTES:
-        raise BadHttpRequest("413 Payload Too Large", "body too large")
-    body = b""
-    if length:
-        body = await asyncio.wait_for(reader.readexactly(length), 60)
+        text = line.decode("latin-1").rstrip("\r\n")
+        if text[:1] in (" ", "\t") and last_key:
+            # obs-fold continuation: append to the previous header value
+            headers[last_key] = headers[last_key] + " " + text.strip()
+            continue
+        k, _, v = text.partition(":")
+        k = k.strip().lower()
+        if not k:
+            continue
+        headers[k] = v.strip()
+        last_key = k
+    te = headers.get("transfer-encoding", "").lower()
+    te_tokens = [t.strip() for t in te.split(",") if t.strip()]
+    if te_tokens and te_tokens != ["chunked"]:
+        raise BadHttpRequest("501 Not Implemented", "unsupported transfer-encoding")
+    if te_tokens:
+        # Transfer-Encoding wins over Content-Length per RFC 7230
+        body = await read_chunked(reader)
+    else:
+        try:
+            length = int(headers.get("content-length", "0") or "0")
+        except ValueError:
+            raise BadHttpRequest("400 Bad Request", "bad content-length")
+        if length < 0:
+            raise BadHttpRequest("400 Bad Request", "bad content-length")
+        if length > MAX_BODY_BYTES:
+            raise BadHttpRequest("413 Payload Too Large", "body too large")
+        if (
+            length
+            and writer is not None
+            and headers.get("expect", "").lower() == "100-continue"
+        ):
+            writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            await writer.drain()
+        body = b""
+        if length:
+            body = await asyncio.wait_for(reader.readexactly(length), 60)
+    conn = headers.get("connection", "").lower()
+    if "close" in conn:
+        keep = False
+    elif version >= "HTTP/1.1":
+        keep = True
+    elif "keep-alive" in conn:
+        keep = True
+    else:
+        keep = False
     parsed = urlparse(target)
-    return method, parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}, headers, body
+    return method, parsed.path, {k: v[0] for k, v in parse_qs(parsed.query).items()}, headers, body, keep
 
 
-def serve_static(path):
+def serve_static(path, keep=False):
     full = os.path.normpath(os.path.join(WEB, path.lstrip("/") or "index.html"))
     if not full.startswith(WEB + os.sep):
         return _http_response("403 Forbidden", b"forbidden")
@@ -586,10 +675,170 @@ def serve_static(path):
     data = open(full, "rb").read()
     ext = os.path.splitext(full)[1].lower()
     ctype = CONTENT_TYPES.get(ext, "application/octet-stream")
-    return _http_response("200 OK", data, ctype)
+    return _http_response("200 OK", data, ctype, keep=keep)
+
+
+def _token_from(headers, q, j):
+    """Header first, then JSON body, then query string."""
+    t = headers.get(TOKEN_HEADER)
+    if isinstance(t, str) and t:
+        return t
+    if isinstance(j, dict):
+        t = j.get("token")
+        if isinstance(t, str):
+            return t
+    t = q.get("token")
+    return t if isinstance(t, str) else None
+
+
+async def route(gw, method, path, q, headers, body, keep, conn):
+    """Dispatch one parsed request. Returns (response_bytes, keep_alive)."""
+
+    def fail(status, obj):
+        return _json(status, obj, keep=keep), keep
+
+    def auth_fail(status="401 Unauthorized", err="unauthorized"):
+        conn["auth_failures"] = conn.get("auth_failures", 0) + 1
+        forced_close = conn["auth_failures"] >= AUTH_FAILURES_LIMIT
+        alive = keep and not forced_close
+        return _json(status, {"ok": False, "error": err}, keep=alive), alive
+
+    if method == "GET" and not path.startswith("/api"):
+        return serve_static(path, keep=keep), keep
+    if method == "GET" and path == "/api/health":
+        return _json(
+            "200 OK",
+            {
+                "ok": True,
+                "bridge": "connected" if gw.bridge.connected else "disconnected",
+                "tailscale": os.environ.get("TS_IP", ""),
+                "time": time.time(),
+            },
+            keep=keep,
+        ), keep
+    if method == "POST" and path == "/api/rpc":
+        try:
+            j = json.loads(body.decode("utf-8"))
+        except Exception:
+            return fail("400 Bad Request", {"ok": False, "error": "bad json"})
+        if not isinstance(j, dict):
+            return fail("400 Bad Request", {"ok": False, "error": "bad json"})
+        if not token_ok(_token_from(headers, q, j), gw.cfg["gatewayToken"]):
+            return auth_fail()
+        m = j.get("method")
+        if m not in RPC_WHITELIST:
+            return fail("403 Forbidden", {"ok": False, "error": "method_not_allowed"})
+        params = j.get("params") or {}
+        if m in ("session.startTurn", "session.createAndStart"):
+            params = dict(params)
+        if m == "session.startTurn" and "clientMessageId" not in params:
+            params["clientMessageId"] = uuid.uuid4().hex
+        try:
+            result = await gw.bridge.request(m, params, timeout=120)
+            return _json("200 OK", {"ok": True, "result": result}, keep=keep), keep
+        except Exception as exc:
+            return _json("502 Bad Gateway", {"ok": False, "error": str(exc)}, keep=keep), keep
+    if method == "GET" and path == "/api/events":
+        j = {}
+        if body:
+            try:
+                j = json.loads(body.decode("utf-8"))
+            except Exception:
+                j = {}
+        if not token_ok(_token_from(headers, q, j), gw.cfg["gatewayToken"]):
+            return auth_fail()
+        since = 0.0
+        try:
+            since = float(q.get("since", "0"))
+        except Exception:
+            pass
+        had = bool(q.get("had", ""))
+        out = [e for e in gw.events if e["ts"] > since]
+        if not out and had:
+            # long-poll only when there is nothing newer than `since`;
+            # a first-time client (no `had`) gets its snapshot immediately.
+            fut = asyncio.get_running_loop().create_future()
+            gw.clients.add(fut)
+            try:
+                try:
+                    await asyncio.wait_for(fut, 20)
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                gw.clients.discard(fut)
+            out = [e for e in gw.events if e["ts"] > since]
+        # ensure a first-time client gets the current sessions snapshot
+        if not had:
+            out.insert(0, {"ts": time.time(), "type": "sessions", "data": {"sessions": gw.sessions}})
+        return _json("200 OK", {"ts": time.time(), "events": out}, keep=keep), keep
+    if method == "POST" and path == "/api/watch":
+        try:
+            j = json.loads(body.decode("utf-8"))
+        except Exception:
+            j = {}
+        if not isinstance(j, dict):
+            j = {}
+        if not token_ok(_token_from(headers, q, j), gw.cfg["gatewayToken"]):
+            return auth_fail()
+        sid = j.get("sessionId")
+        if not sid:
+            return fail("400 Bad Request", {"ok": False, "error": "no sessionId"})
+        if j.get("unwatch"):
+            gw.unwatch(sid)
+        else:
+            gw.watch(sid)
+        return _json("200 OK", {"ok": True}, keep=keep), keep
+    if method == "POST" and path == "/api/upload":
+        try:
+            j = json.loads(body.decode("utf-8"))
+        except Exception:
+            j = {}
+        if not isinstance(j, dict):
+            return fail("400 Bad Request", {"ok": False, "error": "bad json"})
+        if not token_ok(_token_from(headers, q, j), gw.cfg["gatewayToken"]):
+            return auth_fail()
+        try:
+            name = str(j.get("name") or "file")[:255]
+            media = str(j.get("mediaType") or "application/octet-stream")
+            data = j.get("data")
+            if not isinstance(data, str):
+                raise ValueError("data (base64) is required")
+            raw = base64.b64decode(data)
+            size = len(raw)
+            if size < 1 or size > gw.cfg.get("maxAttachmentBytes", 50 * 1024 * 1024):
+                raise ValueError("file size out of bounds")
+            upload_id = secrets.token_hex(16)
+            file_id = "file_" + uuid.uuid4().hex
+            sha = hashlib.sha256(raw).hexdigest()
+            stage = gw.cfg.get("attachmentStagingPath") or os.path.expanduser(
+                "~/.dsh/agents-anywhere/bridge/attachments/staging"
+            )
+            os.makedirs(stage, exist_ok=True)
+            dst = os.path.join(stage, upload_id)
+            with open(dst, "wb") as fh:
+                fh.write(raw)
+            return _json(
+                "200 OK",
+                {
+                    "ok": True,
+                    "attachment": {
+                        "fileId": file_id,
+                        "uploadId": upload_id,
+                        "name": name,
+                        "mediaType": media,
+                        "size": size,
+                        "sha256": sha,
+                    },
+                },
+                keep=keep,
+            ), keep
+        except Exception as exc:
+            return fail("400 Bad Request", {"ok": False, "error": str(exc)})
+    return _http_response("404 Not Found", b"not found", keep=keep), keep
 
 
 async def handle_http(reader, writer, gw):
+    conn = {"auth_failures": 0}
     try:
         peer = writer.get_extra_info("peername")
         peer_ip = None
@@ -601,159 +850,27 @@ async def handle_http(reader, writer, gw):
             writer.write(_json("403 Forbidden", {"ok": False, "error": "ip_not_allowed"}))
             await writer.drain()
             return
-        try:
-            req = await read_request_head(reader)
-        except BadHttpRequest as exc:
-            writer.write(_json(exc.status, {"ok": False, "error": exc.message}))
+        served = 0
+        while True:
+            try:
+                req = await read_request_head(reader, writer)
+            except BadHttpRequest as exc:
+                writer.write(_json(exc.status, {"ok": False, "error": exc.message}))
+                await writer.drain()
+                return
+            if req is None:
+                return
+            method, path, q, headers, body, keep = req
+            try:
+                resp, keep = await route(gw, method, path, q, headers, body, keep, conn)
+            except Exception as exc:
+                resp = _json("500 Internal Server Error", {"ok": False, "error": str(exc)})
+                keep = False
+            writer.write(resp)
             await writer.drain()
-            return
-        if req is None:
-            writer.close()
-            return
-        method, path, q, headers, body = req
-        if method == "GET" and not path.startswith("/api"):
-            writer.write(serve_static(path))
-        elif method == "GET" and path == "/api/health":
-            writer.write(
-                _json(
-                    "200 OK",
-                    {
-                        "ok": True,
-                        "bridge": "connected" if gw.bridge.connected else "disconnected",
-                        "tailscale": os.environ.get("TS_IP", ""),
-                        "time": time.time(),
-                    },
-                )
-            )
-        elif method == "POST" and path == "/api/rpc":
-            try:
-                j = json.loads(body.decode("utf-8"))
-            except Exception:
-                writer.write(_json("400 Bad Request", {"ok": False, "error": "bad json"}))
-                await writer.drain()
-                writer.close()
+            served += 1
+            if not keep or served >= MAX_REQS_PER_CONN:
                 return
-            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
-                writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
-                await writer.drain()
-                writer.close()
-                return
-            m = j.get("method")
-            if m not in RPC_WHITELIST:
-                writer.write(_json("403 Forbidden", {"ok": False, "error": "method_not_allowed"}))
-                await writer.drain()
-                writer.close()
-                return
-            params = j.get("params") or {}
-            if m in ("session.startTurn", "session.createAndStart"):
-                params = dict(params)
-            if m == "session.startTurn" and "clientMessageId" not in params:
-                params["clientMessageId"] = uuid.uuid4().hex
-            try:
-                result = await gw.bridge.request(m, params, timeout=120)
-                writer.write(_json("200 OK", {"ok": True, "result": result}))
-            except Exception as exc:
-                writer.write(_json("502 Bad Gateway", {"ok": False, "error": str(exc)}))
-        elif method == "GET" and path == "/api/events":
-            j = json.loads(body.decode("utf-8")) if body else {}
-            tok = q.get("token") or j.get("token")
-            if not token_ok(tok, gw.cfg["gatewayToken"]):
-                writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
-                await writer.drain()
-                writer.close()
-                return
-            since = 0.0
-            try:
-                since = float(q.get("since", "0"))
-            except Exception:
-                pass
-            fut = asyncio.get_running_loop().create_future()
-            gw.clients.add(fut)
-            try:
-                # wait for an event or timeout (20s) for long-poll
-                try:
-                    await asyncio.wait_for(fut, 20)
-                except asyncio.TimeoutError:
-                    pass
-            finally:
-                gw.clients.discard(fut)
-            out = [e for e in gw.events if e["ts"] > since]
-            # ensure a first-time client gets the current sessions snapshot
-            if not q.get("had", ""):
-                out.insert(0, {"ts": time.time(), "type": "sessions", "data": {"sessions": gw.sessions}})
-            writer.write(_json("200 OK", {"ts": time.time(), "events": out}))
-        elif method == "POST" and path == "/api/watch":
-            try:
-                j = json.loads(body.decode("utf-8"))
-            except Exception:
-                j = {}
-            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
-                writer.write(_json("401 Unauthorized", {"ok": False}))
-                await writer.drain()
-                writer.close()
-                return
-            sid = j.get("sessionId")
-            if not sid:
-                writer.write(_json("400 Bad Request", {"ok": False, "error": "no sessionId"}))
-                await writer.drain()
-                writer.close()
-                return
-            if j.get("unwatch"):
-                gw.unwatch(sid)
-            else:
-                gw.watch(sid)
-            writer.write(_json("200 OK", {"ok": True}))
-        elif method == "POST" and path == "/api/upload":
-            try:
-                j = json.loads(body.decode("utf-8"))
-            except Exception:
-                j = {}
-            if not token_ok(j.get("token"), gw.cfg["gatewayToken"]):
-                writer.write(_json("401 Unauthorized", {"ok": False, "error": "unauthorized"}))
-                await writer.drain()
-                writer.close()
-                return
-            try:
-                name = str(j.get("name") or "file")[:255]
-                media = str(j.get("mediaType") or "application/octet-stream")
-                data = j.get("data")
-                if not isinstance(data, str):
-                    raise ValueError("data (base64) is required")
-                raw = base64.b64decode(data)
-                size = len(raw)
-                if size < 1 or size > gw.cfg.get("maxAttachmentBytes", 50 * 1024 * 1024):
-                    raise ValueError("file size out of bounds")
-                upload_id = secrets.token_hex(16)
-                file_id = "file_" + uuid.uuid4().hex
-                sha = hashlib.sha256(raw).hexdigest()
-                stage = gw.cfg.get("attachmentStagingPath") or os.path.expanduser(
-                    "~/.dsh/agents-anywhere/bridge/attachments/staging"
-                )
-                os.makedirs(stage, exist_ok=True)
-                dst = os.path.join(stage, upload_id)
-                with open(dst, "wb") as fh:
-                    fh.write(raw)
-                writer.write(
-                    _json(
-                        "200 OK",
-                        {
-                            "ok": True,
-                            "attachment": {
-                                "fileId": file_id,
-                                "uploadId": upload_id,
-                                "name": name,
-                                "mediaType": media,
-                                "size": size,
-                                "sha256": sha,
-                            },
-                        },
-                    )
-                )
-            except Exception as exc:
-                writer.write(_json("400 Bad Request", {"ok": False, "error": str(exc)}))
-        else:
-            writer.write(_http_response("404 Not Found", b"not found"))
-        await writer.drain()
     except Exception as exc:
         try:
             writer.write(_json("500 Internal Server Error", {"ok": False, "error": str(exc)}))
@@ -767,6 +884,36 @@ async def handle_http(reader, writer, gw):
             pass
 
 
+def cleanup_staging(stage, retention_secs):
+    """Delete staged uploads older than retention_secs. Returns removed count."""
+    if not stage or not os.path.isdir(stage):
+        return 0
+    cutoff = time.time() - max(0, retention_secs)
+    removed = 0
+    for name in os.listdir(stage):
+        p = os.path.join(stage, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+async def staging_cleanup_loop(cfg):
+    stage = cfg.get("attachmentStagingPath")
+    retention = cfg.get("stagingRetentionSecs", 7 * 86400)
+    while True:
+        try:
+            n = cleanup_staging(stage, retention)
+            if n:
+                print(f"staging: purged {n} stale attachment(s)")
+        except Exception:
+            pass
+        await asyncio.sleep(3600)
+
+
 async def main():
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
@@ -777,6 +924,11 @@ async def main():
         json.dump(cfg, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     else:
         json.dump(cfg, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    if cfg.get("listenHost") in ("0.0.0.0", "::") and not cfg.get("allowedIps"):
+        print("WARNING: listening on ALL interfaces with an empty IP allowlist.")
+        print("         Any device on any network this PC joins can reach this port.")
+        print('         Set allowedIps (e.g. ["100.64.0.0/10"]) in config.json to restrict.')
 
     gw = Gateway(cfg)
     if not cfg.get("ntfyTopic"):
@@ -792,6 +944,7 @@ async def main():
     tasks = [
         asyncio.create_task(gw.bridge_loop()),
         asyncio.create_task(gw.poll_loop()),
+        asyncio.create_task(staging_cleanup_loop(cfg)),
     ]
     async with server:
         await server.serve_forever()

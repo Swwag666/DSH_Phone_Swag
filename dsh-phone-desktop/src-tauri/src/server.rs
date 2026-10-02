@@ -160,8 +160,18 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
     }
 }
 
-async fn events(State(gw): State<Arc<Gateway>>, Query(q): Query<HashMap<String, String>>) -> Response {
-    let token = q.get("token").cloned().unwrap_or_default();
+async fn events(
+    State(gw): State<Arc<Gateway>>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: header::HeaderMap,
+) -> Response {
+    // X-Dsh-Token header first; the query form stays as a fallback.
+    let token = headers
+        .get("x-dsh-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| q.get("token").cloned())
+        .unwrap_or_default();
     let hub = match gw.find_hub(&token) {
         Some(h) => h,
         None => {
@@ -303,6 +313,46 @@ fn write_staging(stage: &str, upload_id: &str, raw: &[u8]) -> Result<(), String>
     std::fs::write(path, raw).map_err(|e| e.to_string())
 }
 
+/// Deletes staged uploads older than `retention_secs`. Returns removed count.
+fn cleanup_staging(stage: &str, retention_secs: u64) -> usize {
+    let dir = std::path::Path::new(stage);
+    if !dir.is_dir() {
+        return 0;
+    }
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_secs))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let stale = std::fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .map(|t| t < cutoff)
+                .unwrap_or(false);
+            if stale && std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+async fn staging_cleanup_loop(gw: Arc<Gateway>) {
+    let stage = gw.cfg.staging_path.clone();
+    let retention = gw.cfg.staging_retention_secs;
+    loop {
+        let n = cleanup_staging(&stage, retention);
+        if n > 0 {
+            eprintln!("dsh-phone: staging purged {n} stale attachment(s)");
+        }
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
 async fn root() -> Response {
     static_response("text/html; charset=utf-8", pwa::INDEX_HTML.to_string())
 }
@@ -433,7 +483,27 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .layer(middleware::from_fn_with_state(gw.clone(), ip_filter))
         .with_state(gw.clone());
 
-    let addr = std::net::SocketAddr::from(([0u8, 0, 0, 0], port));
+    // Honour listen_host from the config (it was previously ignored and the
+    // node always bound 0.0.0.0).
+    let host: std::net::IpAddr = gw
+        .cfg
+        .listen_host
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    if host.is_unspecified() && gw.cfg.allowed_ips.is_empty() {
+        eprintln!(
+            "dsh-phone: WARNING: listening on ALL interfaces with an empty IP allowlist -"
+        );
+        eprintln!(
+            "dsh-phone: the node is reachable from every network this PC joins."
+        );
+        eprintln!("dsh-phone: set allowed_ips in the config to restrict (e.g. 100.64.0.0/10).");
+    }
+    let addr = SocketAddr::from((host, port));
+
+    // Staged attachments no longer live forever: hourly purge of files
+    // older than staging_retention_secs (7 days by default).
+    tokio::spawn(staging_cleanup_loop(gw.clone()));
 
     if gw.cfg.tls_enabled {
         match crate::tls::rustls_config(&gw.cfg).await {
@@ -483,4 +553,91 @@ async fn serve_http(
         let _ = rx.recv().await;
     })
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelist_is_16_methods() {
+        assert_eq!(WHITELIST.len(), 16);
+        // the README/agent docs must match this count
+    }
+
+    #[test]
+    fn whitelist_has_no_duplicates() {
+        let mut sorted = WHITELIST.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), WHITELIST.len());
+    }
+
+    #[test]
+    fn staging_cleanup_respects_retention() {
+        let dir = std::env::temp_dir().join(format!("dsh-stage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("old.bin");
+        let fresh = dir.join("fresh.bin");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&fresh, b"fresh").unwrap();
+
+        let past = std::time::SystemTime::now() - Duration::from_secs(8 * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+
+        let removed = cleanup_staging(&dir.to_string_lossy(), 7 * 86400);
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+
+        // retention=0: everything is stale (mtime pinned 1s into the past so
+        // the check does not race on timestamp granularity)
+        std::fs::write(&fresh, b"fresh2").unwrap();
+        let past2 = std::time::SystemTime::now() - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(past2))
+            .unwrap();
+        assert_eq!(cleanup_staging(&dir.to_string_lossy(), 0), 1);
+        assert!(!fresh.exists());
+
+        // missing directory is a no-op
+        assert_eq!(cleanup_staging("Z:/definitely/not/here", 60), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_cleanup_keeps_directories_untouched() {
+        let dir = std::env::temp_dir().join(format!("dsh-stage-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let old = dir.join("nested").join("keep.bin");
+        std::fs::write(&old, b"x").unwrap();
+        let past = std::time::SystemTime::now() - Duration::from_secs(99 * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(past))
+            .unwrap();
+
+        // single-level scan, matching write_staging layout: a stale file
+        // inside a subdirectory is not removed, the subdirectory itself
+        // is never deleted
+        assert_eq!(cleanup_staging(&dir.to_string_lossy(), 7 * 86400), 0);
+        assert!(dir.join("nested").is_dir());
+        assert!(old.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

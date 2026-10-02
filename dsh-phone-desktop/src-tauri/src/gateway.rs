@@ -451,15 +451,11 @@ impl DeviceHub {
         let state_changed = {
             let mut st = self.state.lock().unwrap();
             match st.watched.get_mut(sid) {
-                Some(w) => {
-                    if w.last_state_key != key {
-                        w.last_state_key = key;
-                        true
-                    } else {
-                        false
-                    }
+                Some(w) if w.last_state_key != key => {
+                    w.last_state_key = key;
+                    true
                 }
-                None => false,
+                _ => false,
             }
         };
         if state_changed {
@@ -543,17 +539,16 @@ impl DeviceHub {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let batch_seq = params.get("batchSeq").and_then(|v| v.as_i64());
-        match (ops, stream_id, batch_seq) {
-            (Some(ops), Some(sid), Some(seq)) => {
-                let _ = self
-                    .bridge
-                    .request(
-                        "runtime.sync.ack",
-                        json!({ "streamId": sid, "batchSeq": seq }),
-                        Duration::from_secs(15),
-                    )
-                    .await;
-                let mut refresh = false;
+        if let (Some(ops), Some(sid), Some(seq)) = (ops, stream_id, batch_seq) {
+            let _ = self
+                .bridge
+                .request(
+                    "runtime.sync.ack",
+                    json!({ "streamId": sid, "batchSeq": seq }),
+                    Duration::from_secs(15),
+                )
+                .await;
+            let mut refresh = false;
                 for op in ops {
                     let kind = op.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                     if kind == "notifications" {
@@ -645,8 +640,6 @@ impl DeviceHub {
                 if refresh {
                     self.debounced_refresh_sessions().await;
                 }
-            }
-            _ => {}
         }
     }
 
@@ -754,5 +747,53 @@ impl Gateway {
                 main: i == 0,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_eq_matches_identical() {
+        assert!(token_eq("a3f0b19c", "a3f0b19c"));
+    }
+
+    #[test]
+    fn token_eq_rejects_mismatch() {
+        assert!(!token_eq("a3f0b19c", "a3f0b19d"));
+    }
+
+    #[test]
+    fn token_eq_rejects_different_lengths() {
+        assert!(!token_eq("a3f0b19c", "a3f0b19c0"));
+        assert!(!token_eq("a3f0b19c0", "a3f0b19c"));
+    }
+
+    #[test]
+    fn token_eq_rejects_empty() {
+        // an empty token must never authenticate, even against another empty
+        assert!(!token_eq("", ""));
+        assert!(!token_eq("", "x"));
+        assert!(!token_eq("x", ""));
+    }
+
+    #[test]
+    fn token_eq_rejects_prefix_and_suffix() {
+        assert!(!token_eq("abc", "abcd"));
+        assert!(!token_eq("abcd", "abc"));
+        assert!(!token_eq("xabcd", "yabcd"));
+    }
+
+    #[test]
+    fn token_eq_same_length_no_early_exit() {
+        // exhaustive same-length comparison: every single-byte flip is caught
+        let a = "0123456789abcdef";
+        for i in 0..a.len() {
+            let mut b: Vec<u8> = a.as_bytes().to_vec();
+            b[i] ^= 1;
+            let b = String::from_utf8(b).unwrap();
+            assert!(!token_eq(a, &b), "flip at {i} went undetected");
+        }
     }
 }
