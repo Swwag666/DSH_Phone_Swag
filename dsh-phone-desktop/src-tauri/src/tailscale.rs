@@ -9,7 +9,7 @@ pub fn detect() -> Value {
     if !installed {
         return json!({ "installed": false, "logged_in": false, "ip": Value::Null });
     }
-    match tailscale_cli() {
+    match cli_path() {
         None => json!({ "installed": true, "logged_in": false, "ip": Value::Null }),
         Some(exe) => match Command::new(&exe).args(["ip", "-4"]).output() {
             Ok(o) if o.status.success() => {
@@ -48,7 +48,7 @@ pub fn install() -> Result<String, String> {
 }
 
 fn tailscale_installed() -> bool {
-    tailscale_cli().is_some()
+    cli_path().is_some()
         || [
             r"C:\Program Files\Tailscale\tailscaled.exe",
             r"C:\Program Files (x86)\Tailscale\tailscaled.exe",
@@ -58,7 +58,9 @@ fn tailscale_installed() -> bool {
         || Path::new(r"C:\ProgramData\Tailscale").exists()
 }
 
-fn tailscale_cli() -> Option<String> {
+/// Absolute path of the tailscale CLI, or None when it is not found.
+/// Checked from the two default install locations and then from PATH.
+pub(crate) fn cli_path() -> Option<String> {
     for c in [
         r"C:\Program Files\Tailscale\tailscale.exe",
         r"C:\Program Files (x86)\Tailscale\tailscale.exe",

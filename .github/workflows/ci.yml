@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  python:
+    name: Python gateway tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unittest suite
+        working-directory: dsh-phone
+        run: python -m unittest -v
+
+  web:
+    name: PWA render tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run md.js tests
+        run: node dsh-phone/web/test-md.js
+      - name: Run itemrender.js tests
+        run: node dsh-phone/web/test-items.js
+
+  rust:
+    name: Rust core tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: dsh-phone-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dsh-phone-desktop/src-tauri -> target
+      - name: Install pnpm dependencies
+        run: pnpm install --frozen-lockfile
+      # generate_context! embeds ../dist, so the frontend must exist before cargo test
+      - name: Build frontend dist
+        run: pnpm run build
+      - name: Run cargo tests
+        working-directory: dsh-phone-desktop/src-tauri
+        run: cargo test --locked
+      - name: Clippy (fail on warnings)
+        working-directory: dsh-phone-desktop/src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings

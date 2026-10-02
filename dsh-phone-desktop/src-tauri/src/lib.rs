@@ -210,9 +210,20 @@ fn tailscale_status() -> serde_json::Value {
 /// Перевязывает сокеты tailscaled - лечит потерю связи после вкл/выкл WARP.
 #[tauri::command]
 fn heal_tailnet() -> serde_json::Value {
-    let ts = "C:\\Program Files\\Tailscale\\tailscale.exe";
+    let ts = match crate::tailscale::cli_path() {
+        Some(p) => p,
+        None => {
+            return serde_json::json!({
+                "ok": false,
+                "rebind": false,
+                "restun": false,
+                "ip": crate::config::tailscale_ip(),
+                "error": "tailscale CLI not found",
+            })
+        }
+    };
     let run = |args: &[&str]| -> bool {
-        std::process::Command::new(ts)
+        std::process::Command::new(&ts)
             .args(args)
             .output()
             .map(|o| o.status.success())
