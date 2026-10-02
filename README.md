@@ -6,7 +6,7 @@
 
 твой ПК · твой телефон · один ключ · ноль посредников
 
-[![release](https://img.shields.io/badge/release-v0.2.0-8a3838?style=flat-square)](https://github.com/Swwag666/DSH_Phone_Swag/releases)
+[![release](https://img.shields.io/badge/release-v0.3.0-8a3838?style=flat-square)](https://github.com/Swwag666/DSH_Phone_Swag/releases)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-232030?style=flat-square)](#)
 [![stack](https://img.shields.io/badge/stack-Rust%20·%20Tauri%20v2%20·%20axum-7e2233?style=flat-square)](#как-это-устроено)
 [![license](https://img.shields.io/badge/license-MIT-6c9a62?style=flat-square)](LICENSE)
@@ -18,6 +18,8 @@
 ---
 
 Управляй сессиями [DeepSeek Harness](https://github.com/deepseek-ai) со своего телефона - с дивана, из метро, с другого конца страны. DSH Phone поднимает на твоём ПК локальный узел, телефон цепляется к нему через [Tailscale](https://tailscale.com), и всё: список проектов, живой чат с агентом, ответы на апрувы, фото с камеры, голосовые. Никакого чужого облака, никаких серверов-посредников, никаких утечек. Данные не покидают твою сеть.
+
+> Пошаговая установка с проверкой каждого звена и траблшутингом - **[GUIDE.md](GUIDE.md)**.
 
 ---
 
