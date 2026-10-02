@@ -86,6 +86,21 @@ pub fn new_token() -> String {
 }
 
 pub fn tailscale_ip() -> String {
+    // 1) авторитетный источник - сам tailscale CLI
+    for exe in [
+        r"C:\Program Files\Tailscale\tailscale.exe".to_string(),
+        "tailscale.exe".to_string(),
+    ] {
+        if let Ok(out) = std::process::Command::new(&exe).arg("ip").arg("-4").output() {
+            if out.status.success() {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.starts_with("100.") {
+                    return s;
+                }
+            }
+        }
+    }
+    // 2) интерфейс из CGNAT-диапазона tailnet
     if let Ok(addrs) = get_if_addrs::get_if_addrs() {
         for a in &addrs {
             if let std::net::IpAddr::V4(v4) = a.ip() {
@@ -95,15 +110,8 @@ pub fn tailscale_ip() -> String {
                 }
             }
         }
-        for a in &addrs {
-            if let std::net::IpAddr::V4(v4) = a.ip() {
-                let o = v4.octets();
-                if o[0] == 10 || o[0] == 172 || o[0] == 192 {
-                    return v4.to_string();
-                }
-            }
-        }
     }
+    // 3) не врём про чужие адаптеры (WARP/виртуалки) - честный loopback
     "127.0.0.1".to_string()
 }
 
