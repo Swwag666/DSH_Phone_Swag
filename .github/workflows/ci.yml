@@ -20,7 +20,7 @@ jobs:
         run: python -m unittest -v
 
   web:
-    name: PWA markdown tests
+    name: PWA render tests
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -30,6 +30,8 @@ jobs:
           node-version: "22"
       - name: Run md.js tests
         run: node dsh-phone/web/test-md.js
+      - name: Run itemrender.js tests
+        run: node dsh-phone/web/test-items.js
 
   rust:
     name: Rust core tests

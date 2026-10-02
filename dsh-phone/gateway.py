@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
         "~/.dsh/agents-anywhere/bridge/endpoint.json"
     ),
     "connectorId": "dsh-phone-gateway",
-    "pollSeconds": 2.0,
+    "pollSeconds": 1.0,
     "eventBufferMax": 400,
     "attachmentStagingPath": os.path.expanduser(
         "~/.dsh/agents-anywhere/bridge/attachments/staging"

@@ -51,7 +51,7 @@ fn default_bridge_endpoint() -> String {
         .to_string()
 }
 fn default_poll_seconds() -> f64 {
-    2.0
+    1.0
 }
 fn default_event_buffer_max() -> usize {
     400
@@ -140,7 +140,7 @@ impl AppConfig {
             connector_id: "dsh-phone".to_string(),
             created_at_unix: now(),
             bridge_endpoint_path: default_bridge_endpoint(),
-            poll_seconds: 2.0,
+            poll_seconds: default_poll_seconds(),
             event_buffer_max: 400,
             max_attachment_bytes: 50 * 1024 * 1024,
             start_hidden: false,
@@ -159,6 +159,12 @@ impl AppConfig {
                     Ok(mut c) => {
                         c.config_path = cp.to_string_lossy().to_string();
                         c.tailscale_ip = tailscale_ip();
+                        // миграция: старый дефолт 2.0 тормозил подхват чатов
+                        // на клиенте; поднимаем до 1.0, если юзер не выставил
+                        // своё значение ниже.
+                        if c.poll_seconds > 1.9 && c.poll_seconds <= 2.1 {
+                            c.poll_seconds = default_poll_seconds();
+                        }
                         let _ = c.save();
                         return c;
                     }
