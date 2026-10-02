@@ -119,6 +119,36 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
                 );
             }
         }
+        let sid = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !sid.is_empty() {
+            let busy = match hub
+                .bridge
+                .request(
+                    "session.getState",
+                    json!({ "sessionId": sid }),
+                    Duration::from_secs(6),
+                )
+                .await
+            {
+                Ok(v) => {
+                    let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                    matches!(st, "running" | "working" | "waiting" | "pending" | "blocked")
+                        || st.starts_with("waiting")
+                }
+                Err(_) => false,
+            };
+            if busy {
+                hub.enqueue_turn(sid, params);
+                return json_status(
+                    StatusCode::OK,
+                    json!({ "ok": true, "result": { "accepted": true, "queued": true } }),
+                );
+            }
+        }
     }
     match hub
         .bridge

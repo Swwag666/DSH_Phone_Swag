@@ -362,8 +362,11 @@ function retryLast() {
   turnT0 = Date.now();
   status("повтор хода…");
   api("session.startTurn", { sessionId: activeSession, content: lastUserText }).then((r) => {
-    status(r.ok ? "повторяю, жду ответ…" : "ошибка: " + (r.error || "?"));
-    if (!r.ok) alert("ошибка: " + (r.error || "?"));
+    if (r.ok) {
+      status(r.result && r.result.queued ? "агент занят - повтор в очереди…" : "повторяю, жду ответ…");
+    } else {
+      status("повтор не прошёл: " + (r.error || "?"));
+    }
   });
 }
 
@@ -801,8 +804,18 @@ $("composer").onsubmit = (e) => {
   const params = { sessionId: activeSession, content: val, attachments: atts };
   status("отправка…");
   api("session.startTurn", params).then((r) => {
-    status(r.ok ? "отправлено, жду ответ…" : "ошибка: " + (r.error || "?"));
-    if (!r.ok) alert("ошибка: " + (r.error || "?"));
+    if (r.ok) {
+      const queued = r.result && r.result.queued;
+      status(queued
+        ? "агент занят - сообщение в очереди, уйдёт как освободится…"
+        : "отправлено, жду ответ…");
+    } else {
+      $("input").value = val;
+      pendingAttachments = atts;
+      renderChips();
+      autoGrow();
+      status("не ушло: " + (r.error || "?") + " - вернула в поле");
+    }
   });
 };
 

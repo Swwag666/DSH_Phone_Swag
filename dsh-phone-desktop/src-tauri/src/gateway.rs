@@ -20,11 +20,20 @@ pub struct DeviceHub {
     pub connector_id: String,
     pub bridge: Arc<Bridge>,
     state: Mutex<HubState>,
+    outbox: Mutex<Vec<OutgoingTurn>>,
     gen: AtomicU64,
     gen_tx: watch::Sender<u64>,
     refresh_pending: AtomicBool,
     event_buffer_max: usize,
     poll_seconds: f64,
+}
+
+/// Сообщение, принятое на занятую сессию: ждёт освобождения агента.
+struct OutgoingTurn {
+    session_id: String,
+    params: Value,
+    queued_at: f64,
+    attempts: u32,
 }
 
 struct Watched {
@@ -90,6 +99,7 @@ impl DeviceHub {
                 watched: HashMap::new(),
                 candidates: HashMap::new(),
             }),
+            outbox: Mutex::new(Vec::new()),
             gen: AtomicU64::new(0),
             gen_tx,
             refresh_pending: AtomicBool::new(false),
@@ -119,7 +129,99 @@ impl DeviceHub {
         handles.push(tauri::async_runtime::spawn(async move {
             this.poll_loop().await;
         }));
+        let this = Arc::clone(self);
+        handles.push(tauri::async_runtime::spawn(async move {
+            this.outbox_loop().await;
+        }));
         handles
+    }
+
+    /// Доложить сообщение в очередь занятой сессии.
+    pub fn enqueue_turn(&self, session_id: String, params: Value) {
+        let mut q = self.outbox.lock().unwrap();
+        q.push(OutgoingTurn {
+            session_id,
+            params,
+            queued_at: now_ts(),
+            attempts: 0,
+        });
+        let n = q.len();
+        drop(q);
+        self.push_event("queued_message", json!({ "depth": n }));
+    }
+
+    /// Сессия сейчас занята (агент думает / ждёт подтверждения)?
+    async fn session_busy(&self, sid: &str) -> bool {
+        match self
+            .bridge
+            .request(
+                "session.getState",
+                json!({ "sessionId": sid }),
+                Duration::from_secs(6),
+            )
+            .await
+        {
+            Ok(v) => {
+                let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                matches!(
+                    st,
+                    "running" | "working" | "waiting" | "pending" | "blocked"
+                ) || st.starts_with("waiting")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Разгон очереди: как только сессия освободилась - сообщение уходит агенту.
+    async fn outbox_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !self.bridge.is_connected() {
+                continue;
+            }
+            loop {
+                let item = {
+                    let mut q = self.outbox.lock().unwrap();
+                    if q.is_empty() {
+                        None
+                    } else {
+                        Some(q.remove(0))
+                    }
+                };
+                let mut item = match item {
+                    Some(i) => i,
+                    None => break,
+                };
+                if now_ts() - item.queued_at > 1800.0 {
+                    self.push_event("queued_drop", json!({ "reason": "stale" }));
+                    continue;
+                }
+                if self.session_busy(&item.session_id).await {
+                    let mut q = self.outbox.lock().unwrap();
+                    q.insert(0, item);
+                    break;
+                }
+                match self
+                    .bridge
+                    .request("session.startTurn", item.params.clone(), Duration::from_secs(120))
+                    .await
+                {
+                    Ok(_) => {
+                        self.push_event("queued_flush", json!({ "sessionId": item.session_id }));
+                    }
+                    Err(_) => {
+                        item.attempts += 1;
+                        let mut q = self.outbox.lock().unwrap();
+                        if item.attempts < 5 {
+                            q.insert(0, item);
+                        } else {
+                            self.push_event("queued_drop", json!({ "reason": "bridge" }));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn gen_rx(&self) -> watch::Receiver<u64> {
