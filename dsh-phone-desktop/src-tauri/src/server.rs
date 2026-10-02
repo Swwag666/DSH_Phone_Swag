@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State},
     http::{header, StatusCode, Uri},
     middleware::{self, Next},
     response::Response,
@@ -312,7 +312,10 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
         .route("/api/watch", post(watch))
-        .route("/api/upload", post(upload))
+        .route(
+            "/api/upload",
+            post(upload).layer(DefaultBodyLimit::max(80 * 1024 * 1024)),
+        )
         .route("/", get(root))
         .fallback(static_fallback)
         .layer(middleware::from_fn_with_state(gw.clone(), count_reqs))

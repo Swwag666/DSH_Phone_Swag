@@ -991,7 +991,7 @@ function renderChips() {
   el.innerHTML = pendingAttachments.map((a, i) => {
     const thumb = (a.isImage && a.preview)
       ? `<img class="chip-thumb" src="${a.preview}" alt="" />`
-      : `<span class="chip-ico">${a.isImage ? "🖼" : "📄"}</span>`;
+      : `<span class="chip-ico">${a.mediaType && a.mediaType.startsWith("audio/") ? "🎙" : (a.isImage ? "🖼" : "📄")}</span>`;
     return `<span class="chip">${thumb}<span class="chip-name">${escapeHtml(a.name)}</span><button class="chip-x" data-i="${i}">✕</button></span>`;
   }).join("");
   el.querySelectorAll(".chip-x").forEach((b) => {
@@ -1004,20 +1004,24 @@ async function handleFiles(files) {
     if (!f) continue;
     status("заливаю: " + f.name + "…");
     try {
-      const data = await readFileBase64(f);
-      const isImage = (f.type || "").startsWith("image/");
-      const fullUrl = "data:" + (f.type || "application/octet-stream") + ";base64," + data;
+      let file = f;
+      if ((f.type || "").startsWith("image/")) {
+        try { file = await prepareImage(f); } catch (_) { file = f; }
+      }
+      const data = await readFileBase64(file);
+      const isImage = (file.type || "").startsWith("image/");
+      const fullUrl = "data:" + (file.type || "application/octet-stream") + ";base64," + data;
       let preview = fullUrl;
       if (isImage) { try { preview = await makeThumb(fullUrl); } catch (_) { preview = fullUrl; } }
       const r = await fetch("/api/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, name: f.name, mediaType: f.type || "application/octet-stream", data }),
+        body: JSON.stringify({ token, name: file.name, mediaType: file.type || "application/octet-stream", data }),
       }).then((x) => x.json());
       if (r.ok) {
         pendingAttachments.push(Object.assign({}, r.attachment, { isImage, preview }));
         renderChips();
-        status("добавлено: " + f.name);
+        status("добавлено: " + file.name + (file !== f ? " (сжато до jpeg)" : ""));
       } else {
         status("не загрузилось: " + (r.error || "?"));
       }
@@ -1026,6 +1030,43 @@ async function handleFiles(files) {
     }
   }
   $("file-input").value = "";
+  $("cam-input").value = "";
+}
+
+// фото с камеры телефона: HEIC/тяжёлые -> сжатый JPEG, который читает агент
+function loadImgEl(url) {
+  return new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = () => rej(new Error("не декодируется"));
+    i.src = url;
+  });
+}
+
+async function prepareImage(f) {
+  const heavy = f.size > 1200 * 1024;
+  const exotic = /heic|heif/i.test(f.type + " " + f.name) || !/jpeg|png|webp|gif/i.test(f.type || "");
+  if (!heavy && !exotic) return f;
+  const url = URL.createObjectURL(f);
+  try {
+    const img = await loadImgEl(url);
+    const w0 = img.naturalWidth || img.width;
+    const h0 = img.naturalHeight || img.height;
+    if (!w0 || !h0) return f;
+    const maxSide = 2048;
+    const s = Math.min(1, maxSide / Math.max(w0, h0));
+    const w = Math.max(1, Math.round(w0 * s));
+    const h = Math.max(1, Math.round(h0 * s));
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    c.getContext("2d").drawImage(img, 0, 0, w, h);
+    const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.85));
+    if (!blob || blob.size >= f.size) return f;
+    const base = String(f.name || "photo").replace(/\.[^.]+$/, "");
+    return new File([blob], base + ".jpg", { type: "image/jpeg" });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function makeThumb(url) {
@@ -1067,19 +1108,75 @@ function readFileBase64(file) {
 $("cam").onclick = () => $("cam-input").click();
 $("cam-input").addEventListener("change", (e) => handleFiles(e.target.files));
 
-// ---------- voice input (Web Speech API) ----------
+// ---------- voice input: диктовка (Web Speech) или голосовое сообщение (MediaRecorder) ----------
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 let recog = null, recActive = false, recBase = "";
+let mediaRec = null, mediaChunks = [], mediaTimer = null;
 
-if (!SR) {
-  $("mic").style.display = "none";
-} else {
-  $("mic").onclick = () => {
-    if (recActive) { try { recog.stop(); } catch (_) {} return; }
-    if (!window.isSecureContext) { status("голосу нужен https — включи TLS на узле"); return; }
-    startVoice();
-  };
+function pickRecMime() {
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+  const list = ["audio/mp4;codecs=mp4a.40.2", "audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
+  for (const m of list) { try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (_) {} }
+  return "";
 }
+
+function stopVoiceMemo() {
+  if (mediaRec && mediaRec.state !== "inactive") { try { mediaRec.stop(); } catch (_) {} }
+}
+
+async function startVoiceMemo() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    status("микрофон не дан: " + (e.name || "нет доступа"));
+    return;
+  }
+  const mime = pickRecMime();
+  try { mediaRec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream); }
+  catch (_) { mediaRec = new MediaRecorder(stream); }
+  mediaChunks = [];
+  const t0 = Date.now();
+  recActive = true;
+  $("mic").classList.add("rec");
+  status("пиши голосовое… ещё раз нажми, чтобы отправить в чат");
+  mediaRec.ondataavailable = (e) => { if (e.data && e.data.size) mediaChunks.push(e.data); };
+  mediaRec.onstop = async () => {
+    recActive = false;
+    $("mic").classList.remove("rec");
+    clearInterval(mediaTimer); mediaTimer = null;
+    stream.getTracks().forEach((t) => t.stop());
+    const blob = new Blob(mediaChunks, { type: mediaRec.mimeType || "audio/mp4" });
+    if (!blob.size) { status("пустая запись"); return; }
+    const sec = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    const ext = /webm/i.test(blob.type) ? "webm" : "m4a";
+    const d = new Date();
+    const p = (n) => (n < 10 ? "0" : "") + n;
+    const name = "voice-" + p(d.getHours()) + p(d.getMinutes()) + "-" + sec + "s." + ext;
+    const file = new File([blob], name, { type: blob.type });
+    status("голосовое " + sec + "с - прицепляю…");
+    await handleFiles([file]);
+  };
+  mediaRec.start();
+  mediaTimer = setInterval(() => {
+    if (mediaRec && mediaRec.state === "recording") status("пиши голосовое… " + Math.round((Date.now() - t0) / 1000) + "с");
+  }, 5000);
+}
+
+$("mic").onclick = () => {
+  if (recActive) {
+    if (recog) { try { recog.stop(); } catch (_) {} }
+    stopVoiceMemo();
+    return;
+  }
+  if (!window.isSecureContext) { status("микрофону нужен https - включи TLS на узле"); return; }
+  if (SR) { startVoice(); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") {
+    status("запись голоса в этом браузере не поддерживается");
+    return;
+  }
+  startVoiceMemo();
+};
 
 function startVoice() {
   recActive = true;

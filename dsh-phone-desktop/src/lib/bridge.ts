@@ -51,6 +51,13 @@ export const startServer = (): Promise<ServerStatus> => invoke("start_server");
 export const stopServer = (): Promise<ServerStatus> => invoke("stop_server");
 export const tailscaleStatus = (): Promise<TailscaleStatus> => invoke("tailscale_status");
 export const tailscaleInstall = (): Promise<string> => invoke("tailscale_install");
+export interface HealResult {
+  ok: boolean;
+  rebind: boolean;
+  restun: boolean;
+  ip: string;
+}
+export const healTailnet = (): Promise<HealResult> => invoke("heal_tailnet");
 export const getAutostart = (): Promise<boolean> => invoke("get_autostart");
 export const setAutostart = (enabled: boolean): Promise<boolean> => invoke("set_autostart", { enabled });
 export const setStartHidden = (enabled: boolean): Promise<AppConfig> => invoke("set_start_hidden", { enabled });

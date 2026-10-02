@@ -1,10 +1,14 @@
 {
   "name": "DSH Phone",
   "short_name": "DSH",
+  "description": "узел личной связи с DeepSeek Harness",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#0a0a0d",
-  "theme_color": "#0a0a0d",
+  "display_override": ["standalone", "fullscreen", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#08070c",
+  "theme_color": "#08070c",
   "icons": [
     {
       "src": "/icon.svg",
@@ -12,5 +16,6 @@
       "type": "image/svg+xml",
       "purpose": "any maskable"
     }
-  ]
+  ],
+  "shortcuts": []
 }

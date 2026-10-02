@@ -198,6 +198,28 @@ fn tailscale_status() -> serde_json::Value {
     tailscale::detect()
 }
 
+/// Перевязывает сокеты tailscaled - лечит потерю связи после вкл/выкл WARP.
+#[tauri::command]
+fn heal_tailnet() -> serde_json::Value {
+    let ts = "C:\\Program Files\\Tailscale\\tailscale.exe";
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new(ts)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    let rebind = run(&["debug", "rebind"]);
+    let restun = run(&["debug", "restun"]);
+    let ip = crate::config::tailscale_ip();
+    serde_json::json!({
+        "ok": rebind || restun,
+        "rebind": rebind,
+        "restun": restun,
+        "ip": ip,
+    })
+}
+
 #[tauri::command]
 fn tailscale_install() -> Result<String, String> {
     tailscale::install()
@@ -306,6 +328,7 @@ pub fn run() {
             start_server,
             stop_server,
             tailscale_status,
+            heal_tailnet,
             tailscale_install,
             get_autostart,
             set_autostart,

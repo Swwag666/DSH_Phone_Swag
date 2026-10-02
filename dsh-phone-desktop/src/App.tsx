@@ -10,6 +10,7 @@ import {
   stopServer,
   tailscaleStatus,
   tailscaleInstall,
+  healTailnet,
   getAutostart,
   setAutostart,
   setStartHidden,
@@ -79,6 +80,9 @@ const dict: Record<Lang, Record<string, string>> = {
     tsMissing: "tailscale не найден",
     tsInstall: "установить",
     tsInstalling: "запускаю установку…",
+    tsHeal: "лечить связь",
+    tsHealed: "сокеты перевязаны ·",
+    tsHealFail: "перевязка не удалась",
     autoStart: "Автозапуск с Windows",
     autoStartHint: "узел поднимается при входе в систему, свёрнуто в трее",
     autoStartOn: "автозапуск включён",
@@ -165,6 +169,9 @@ const dict: Record<Lang, Record<string, string>> = {
     tsMissing: "tailscale not found",
     tsInstall: "install",
     tsInstalling: "starting install…",
+    tsHeal: "heal link",
+    tsHealed: "sockets rebound ·",
+    tsHealFail: "rebind failed",
     autoStart: "Start with Windows",
     autoStartHint: "brings the node up at login, minimized to tray",
     autoStartOn: "autostart on",
@@ -377,6 +384,20 @@ export default function App() {
       tailscaleStatus().then(setTs).catch(() => {});
       if (tries >= 15) window.clearInterval(iv);
     }, 4000);
+  };
+
+  const onHealTailnet = async () => {
+    setTsBusy(true);
+    try {
+      const r = await healTailnet();
+      if (r.ok) fireToast(t("tsHealed") + " " + (r.ip || ""));
+      else fireToast(t("tsHealFail"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+    setTsBusy(false);
+    refreshTailscale();
+    getConfig().then(setCfg).catch(() => {});
   };
 
   const onToggleAutostart = async () => {
@@ -838,15 +859,27 @@ export default function App() {
                       </span>
                     : <span className="text-blood">{t("tsMissing")}</span>}
                 </div>
-                {ts && !ts.installed && (
-                  <button
-                    onClick={onInstall}
-                    disabled={tsBusy}
-                    className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition disabled:opacity-40"
-                  >
-                    {t("tsInstall")}
-                  </button>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {ts && ts.installed && (
+                    <button
+                      onClick={onHealTailnet}
+                      disabled={tsBusy}
+                      className="px-3 py-1.5 rounded-sm text-[12px] text-blood border border-blood/40 hover:bg-blood/10 transition disabled:opacity-40"
+                      title="перевязать сокеты tailscale после включения/выключения WARP"
+                    >
+                      {t("tsHeal")}
+                    </button>
+                  )}
+                  {ts && !ts.installed && (
+                    <button
+                      onClick={onInstall}
+                      disabled={tsBusy}
+                      className="px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition disabled:opacity-40"
+                    >
+                      {t("tsInstall")}
+                    </button>
+                  )}
+                </div>
               </div>
               <TunnelFeed active={!!(status?.running)} />
               <div className="mt-3 border-t border-edge pt-1 divide-y divide-edge">
