@@ -67,6 +67,11 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Response {
         "tailscale": gw.cfg.tailscale_ip,
         "tls": if gw.cfg.tls_enabled { "on" } else { "off" },
         "allowlist": gw.cfg.allowed_ips,
+        "devices": gw.device_briefs().iter().map(|d| json!({
+            "name": d.name,
+            "connector": d.connector_id,
+            "bridge": if d.connected { "connected" } else { "disconnected" },
+        })).collect::<Vec<Value>>(),
     });
     if gw.cfg.tls_enabled {
         obj["tls_sha256"] = json!(crate::tls::cert_sha256());
@@ -85,12 +90,15 @@ struct RpcBody {
 }
 
 async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response {
-    if b.token.is_empty() || b.token != gw.cfg.token {
-        return json_status(
-            StatusCode::UNAUTHORIZED,
-            json!({ "ok": false, "error": "unauthorized" }),
-        );
-    }
+    let hub = match gw.find_hub(&b.token) {
+        Some(h) => h,
+        None => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({ "ok": false, "error": "unauthorized" }),
+            )
+        }
+    };
     if !WHITELIST.contains(&b.method.as_str()) {
         return json_status(
             StatusCode::FORBIDDEN,
@@ -112,7 +120,7 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
             }
         }
     }
-    match gw
+    match hub
         .bridge
         .request(&b.method, params, Duration::from_secs(120))
         .await
@@ -124,26 +132,29 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
 
 async fn events(State(gw): State<Arc<Gateway>>, Query(q): Query<HashMap<String, String>>) -> Response {
     let token = q.get("token").cloned().unwrap_or_default();
-    if token.is_empty() || token != gw.cfg.token {
-        return json_status(
-            StatusCode::UNAUTHORIZED,
-            json!({ "ok": false, "error": "unauthorized" }),
-        );
-    }
+    let hub = match gw.find_hub(&token) {
+        Some(h) => h,
+        None => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({ "ok": false, "error": "unauthorized" }),
+            )
+        }
+    };
     let since: f64 = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let had = q.contains_key("had");
-    let mut rx = gw.gen_rx();
+    let mut rx = hub.gen_rx();
     let _ = rx.borrow();
-    let mut evs = gw.collect_events(since).await;
+    let mut evs = hub.collect_events(since).await;
     if evs.is_empty() {
         tokio::select! {
             _ = rx.changed() => {},
             _ = tokio::time::sleep(Duration::from_secs(20)) => {},
         }
-        evs = gw.collect_events(since).await;
+        evs = hub.collect_events(since).await;
     }
     if !had {
-        let snap = gw.sessions_snapshot().await;
+        let snap = hub.sessions_snapshot().await;
         evs.insert(0, Event(json!({ "ts": now_ts(), "type": "sessions", "data": snap })));
     }
     let out: Vec<Value> = evs.into_iter().map(|e| e.0).collect();
@@ -162,9 +173,12 @@ struct WatchBody {
 }
 
 async fn watch(State(gw): State<Arc<Gateway>>, Json(b): Json<WatchBody>) -> Response {
-    if b.token.is_empty() || b.token != gw.cfg.token {
-        return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false }));
-    }
+    let hub = match gw.find_hub(&b.token) {
+        Some(h) => h,
+        None => {
+            return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false }));
+        }
+    };
     if b.sessionId.is_empty() {
         return json_status(
             StatusCode::BAD_REQUEST,
@@ -172,9 +186,9 @@ async fn watch(State(gw): State<Arc<Gateway>>, Json(b): Json<WatchBody>) -> Resp
         );
     }
     if b.unwatch {
-        gw.unwatch(&b.sessionId).await;
+        hub.unwatch(&b.sessionId).await;
     } else {
-        gw.watch(b.sessionId).await;
+        hub.watch(b.sessionId).await;
     }
     json_status(StatusCode::OK, json!({ "ok": true }))
 }
@@ -193,7 +207,7 @@ struct UploadBody {
 }
 
 async fn upload(State(gw): State<Arc<Gateway>>, Json(b): Json<UploadBody>) -> Response {
-    if b.token.is_empty() || b.token != gw.cfg.token {
+    if gw.find_hub(&b.token).is_none() {
         return json_status(
             StatusCode::UNAUTHORIZED,
             json!({ "ok": false, "error": "unauthorized" }),

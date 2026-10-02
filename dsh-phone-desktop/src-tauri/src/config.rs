@@ -4,6 +4,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub name: String,
+    pub token: String,
+    pub connector_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub config_path: String,
     pub token: String,
@@ -27,6 +34,8 @@ pub struct AppConfig {
     pub tls_enabled: bool,
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub devices: Vec<DeviceEntry>,
 }
 
 fn default_bridge_endpoint() -> String {
@@ -124,6 +133,7 @@ impl AppConfig {
             start_hidden: false,
             tls_enabled: false,
             allowed_ips: Vec::new(),
+            devices: Vec::new(),
         }
     }
 
@@ -131,11 +141,18 @@ impl AppConfig {
         let cp = config_path();
         if cp.exists() {
             if let Ok(s) = fs::read_to_string(&cp) {
-                if let Ok(mut c) = serde_json::from_str::<AppConfig>(&s) {
-                    c.config_path = cp.to_string_lossy().to_string();
-                    c.tailscale_ip = tailscale_ip();
-                    let _ = c.save();
-                    return c;
+                match serde_json::from_str::<AppConfig>(&s) {
+                    Ok(mut c) => {
+                        c.config_path = cp.to_string_lossy().to_string();
+                        c.tailscale_ip = tailscale_ip();
+                        let _ = c.save();
+                        return c;
+                    }
+                    Err(e) => {
+                        // не теряем файл молча: сохраняем копию, чтобы ключ можно было вернуть руками
+                        eprintln!("dsh-phone: config parse failed ({e}); backed up");
+                        let _ = fs::copy(&cp, cp.with_extension("json.bak"));
+                    }
                 }
             }
         }

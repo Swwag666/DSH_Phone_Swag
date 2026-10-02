@@ -25,6 +25,7 @@ pub struct RunningServer {
     pub started_at: std::time::Instant,
     pub port: u16,
     pub requests: Arc<AtomicU64>,
+    pub gw: Arc<gateway::Gateway>,
 }
 
 #[derive(Default)]
@@ -39,6 +40,7 @@ pub struct ServerStatus {
     pub uptime_seconds: u64,
     pub requests: u64,
     pub tls_sha256: Option<String>,
+    pub devices: Vec<gateway::DeviceBrief>,
 }
 
 fn status_of(state: &ServerState) -> ServerStatus {
@@ -50,6 +52,7 @@ fn status_of(state: &ServerState) -> ServerStatus {
             uptime_seconds: s.started_at.elapsed().as_secs(),
             requests: s.requests.load(Ordering::Relaxed),
             tls_sha256,
+            devices: s.gw.device_briefs(),
         },
         None => ServerStatus {
             running: false,
@@ -57,12 +60,27 @@ fn status_of(state: &ServerState) -> ServerStatus {
             uptime_seconds: 0,
             requests: 0,
             tls_sha256,
+            devices: Vec::new(),
         },
     }
 }
 
 fn is_running(state: &ServerState) -> bool {
     state.running.lock().unwrap().is_some()
+}
+
+fn stop_inner(state: &ServerState) {
+    let taken = {
+        let mut g = state.running.lock().unwrap();
+        g.take()
+    };
+    if let Some(s) = taken {
+        let _ = s.shutdown.try_send(());
+        s.handle.abort();
+        for h in s.bg {
+            h.abort();
+        }
+    }
 }
 
 fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
@@ -74,10 +92,9 @@ fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
     let port = cfg.listen_port;
     let started_at = std::time::Instant::now();
     let requests = Arc::new(AtomicU64::new(0));
-    let (gw, notify_rx) = gateway::Gateway::new(cfg, requests.clone());
-    let bg = gw.start_background(notify_rx);
+    let (gw, bg) = gateway::Gateway::new(cfg, requests.clone());
     let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-    let handle = tauri::async_runtime::spawn(server::serve(gw, rx));
+    let handle = tauri::async_runtime::spawn(server::serve(gw.clone(), rx));
 
     {
         let mut g = state.running.lock().unwrap();
@@ -88,9 +105,20 @@ fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
             started_at,
             port,
             requests,
+            gw,
         });
     }
     Ok(status_of(state))
+}
+
+/// Restart the node in place so a config change (e.g. new device) takes effect.
+fn restart_if_running(state: &ServerState) {
+    if is_running(state) {
+        stop_inner(state);
+        // даём порту выдохнуться перед повторным биндом
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let _ = do_start(state);
+    }
 }
 
 #[tauri::command]
@@ -119,18 +147,50 @@ fn start_server(state: State<ServerState>) -> Result<ServerStatus, String> {
 
 #[tauri::command]
 fn stop_server(state: State<ServerState>) -> ServerStatus {
-    let taken = {
-        let mut g = state.running.lock().unwrap();
-        g.take()
-    };
-    if let Some(s) = taken {
-        let _ = s.shutdown.try_send(());
-        s.handle.abort();
-        for h in s.bg {
-            h.abort();
-        }
-    }
+    stop_inner(&state);
     status_of(&state)
+}
+
+#[tauri::command]
+fn add_device(name: String, state: State<ServerState>) -> Result<config::AppConfig, String> {
+    let mut c = config::AppConfig::load_or_init();
+    let name: String = name.trim().chars().filter(|ch| !ch.is_control()).take(40).collect();
+    if name.is_empty() {
+        return Err("имя пустое".to_string());
+    }
+    if c.devices.len() >= 8 {
+        return Err("больше 8 устройств не нужно".to_string());
+    }
+    let token = config::new_token();
+    let mut n = c.devices.len() + 2;
+    let connector_id = loop {
+        let cid = format!("dsh-phone-{n}");
+        if cid != c.connector_id && !c.devices.iter().any(|d| d.connector_id == cid) {
+            break cid;
+        }
+        n += 1;
+    };
+    c.devices.push(config::DeviceEntry {
+        name,
+        token,
+        connector_id,
+    });
+    c.save()?;
+    restart_if_running(&state);
+    Ok(c)
+}
+
+#[tauri::command]
+fn remove_device(token: String, state: State<ServerState>) -> Result<config::AppConfig, String> {
+    let mut c = config::AppConfig::load_or_init();
+    let before = c.devices.len();
+    c.devices.retain(|d| d.token != token);
+    if c.devices.len() == before {
+        return Err("устройство не найдено".to_string());
+    }
+    c.save()?;
+    restart_if_running(&state);
+    Ok(c)
 }
 
 #[tauri::command]
@@ -251,7 +311,9 @@ pub fn run() {
             set_autostart,
             set_start_hidden,
             set_allowed_ips,
-            set_tls_enabled
+            set_tls_enabled,
+            add_device,
+            remove_device
         ])
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);

@@ -7,18 +7,32 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
 use crate::bridge::Bridge;
-use crate::config::AppConfig;
 
 /// A single feed event as delivered to the phone: `{"ts", "type", "data"}`.
 #[derive(Clone)]
 pub struct Event(pub Value);
+
+/// One phone-facing device: its own bridge connector, its own event feed,
+/// its own watched sessions. Main device + every extra device.
+pub struct DeviceHub {
+    pub name: String,
+    pub token: String,
+    pub connector_id: String,
+    pub bridge: Arc<Bridge>,
+    state: Mutex<HubState>,
+    gen: AtomicU64,
+    gen_tx: watch::Sender<u64>,
+    refresh_pending: AtomicBool,
+    event_buffer_max: usize,
+    poll_seconds: f64,
+}
 
 struct Watched {
     known_ids: HashSet<String>,
     last_state_key: String,
 }
 
-struct GateState {
+struct HubState {
     events: Vec<Event>,
     sessions: Vec<Value>,
     sessions_hash: String,
@@ -26,15 +40,14 @@ struct GateState {
     candidates: HashMap<String, Value>,
 }
 
-pub struct Gateway {
-    pub cfg: Arc<AppConfig>,
-    pub bridge: Arc<Bridge>,
-    pub started_at: std::time::Instant,
-    pub requests: Arc<AtomicU64>,
-    state: Mutex<GateState>,
-    gen: AtomicU64,
-    gen_tx: watch::Sender<u64>,
-    refresh_pending: AtomicBool,
+/// Snapshot row for status surfaces (desktop UI / health).
+#[derive(Clone, serde::Serialize)]
+pub struct DeviceBrief {
+    pub name: String,
+    pub token: String,
+    pub connector_id: String,
+    pub connected: bool,
+    pub main: bool,
 }
 
 pub fn now_ts() -> f64 {
@@ -53,24 +66,24 @@ fn jitter_backoff(d: Duration) -> Duration {
     Duration::from_millis(ms + extra)
 }
 
-impl Gateway {
-    pub fn new(
-        cfg: Arc<AppConfig>,
-        requests: Arc<AtomicU64>,
+impl DeviceHub {
+    fn new(
+        name: String,
+        token: String,
+        connector_id: String,
+        endpoint_path: String,
+        event_buffer_max: usize,
+        poll_seconds: f64,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
         let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Value>();
         let (gen_tx, _) = watch::channel(0u64);
-        let bridge = Bridge::new(
-            cfg.bridge_endpoint_path.clone(),
-            cfg.connector_id.clone(),
-            notify_tx,
-        );
-        let gw = Arc::new(Gateway {
-            cfg,
+        let bridge = Bridge::new(endpoint_path, connector_id.clone(), notify_tx);
+        let hub = Arc::new(DeviceHub {
+            name,
+            token,
+            connector_id,
             bridge,
-            started_at: std::time::Instant::now(),
-            requests,
-            state: Mutex::new(GateState {
+            state: Mutex::new(HubState {
                 events: Vec::new(),
                 sessions: Vec::new(),
                 sessions_hash: String::new(),
@@ -80,12 +93,14 @@ impl Gateway {
             gen: AtomicU64::new(0),
             gen_tx,
             refresh_pending: AtomicBool::new(false),
+            event_buffer_max,
+            poll_seconds,
         });
-        (gw, notify_rx)
+        (hub, notify_rx)
     }
 
-    /// Spawns the three long-lived looops (bridge notify pump, bridge supervision, poller).
-    pub fn start_background(
+    /// Three long-lived loops per device: notify pump, bridge supervision, poller.
+    fn start_background(
         self: &Arc<Self>,
         mut notify_rx: mpsc::UnboundedReceiver<Value>,
     ) -> Vec<tauri::async_runtime::JoinHandle<()>> {
@@ -107,15 +122,11 @@ impl Gateway {
         handles
     }
 
-    pub fn is_bridge_connected(&self) -> bool {
-        self.bridge.is_connected()
-    }
-
     pub fn gen_rx(&self) -> watch::Receiver<u64> {
         self.gen_tx.subscribe()
     }
 
-    pub fn push_event(&self, type_: &str, data: Value) {
+    fn push_event(&self, type_: &str, data: Value) {
         {
             let mut st = self.state.lock().unwrap();
             st.events.push(Event(json!({
@@ -123,7 +134,7 @@ impl Gateway {
                 "type": type_,
                 "data": data,
             })));
-            let max = self.cfg.event_buffer_max;
+            let max = self.event_buffer_max;
             if st.events.len() > max {
                 let cut = st.events.len() - max;
                 st.events.drain(0..cut);
@@ -197,7 +208,7 @@ impl Gateway {
     }
 
     async fn poll_loop(&self) {
-        let poll = Duration::from_secs_f64(self.cfg.poll_seconds.max(0.5));
+        let poll = Duration::from_secs_f64(self.poll_seconds.max(0.5));
         loop {
             tokio::time::sleep(poll).await;
             if !self.bridge.is_connected() {
@@ -488,5 +499,84 @@ impl Gateway {
         tokio::time::sleep(Duration::from_millis(800)).await;
         self.refresh_pending.store(false, Ordering::Relaxed);
         self.refresh_sessions().await;
+    }
+}
+
+/// Multi-device gateway: main hub (legacy cfg.token/connector) + one hub per
+/// extra device. Each hub is an isolated bridge connection, so each phone sees
+/// its own window in DSH Desktop.
+pub struct Gateway {
+    pub cfg: std::sync::Arc<crate::config::AppConfig>,
+    pub started_at: std::time::Instant,
+    pub requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    hubs: Vec<Arc<DeviceHub>>,
+}
+
+impl Gateway {
+    pub fn new(
+        cfg: std::sync::Arc<crate::config::AppConfig>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> (Arc<Self>, Vec<tauri::async_runtime::JoinHandle<()>>) {
+        let mut hubs = Vec::new();
+        let mut bg = Vec::new();
+
+        let (main, main_rx) = DeviceHub::new(
+            "main".to_string(),
+            cfg.token.clone(),
+            cfg.connector_id.clone(),
+            cfg.bridge_endpoint_path.clone(),
+            cfg.event_buffer_max,
+            cfg.poll_seconds,
+        );
+        bg.extend(main.start_background(main_rx));
+        hubs.push(main);
+
+        for d in &cfg.devices {
+            let (hub, rx) = DeviceHub::new(
+                d.name.clone(),
+                d.token.clone(),
+                d.connector_id.clone(),
+                cfg.bridge_endpoint_path.clone(),
+                cfg.event_buffer_max,
+                cfg.poll_seconds,
+            );
+            bg.extend(hub.start_background(rx));
+            hubs.push(hub);
+        }
+
+        let gw = Arc::new(Gateway {
+            cfg,
+            started_at: std::time::Instant::now(),
+            requests,
+            hubs,
+        });
+        (gw, bg)
+    }
+
+    /// Hub that owns this access token (main or extra device).
+    pub fn find_hub(&self, token: &str) -> Option<Arc<DeviceHub>> {
+        self.hubs.iter().find(|h| h.token == token).cloned()
+    }
+
+    pub fn main_hub(&self) -> &Arc<DeviceHub> {
+        &self.hubs[0]
+    }
+
+    pub fn is_bridge_connected(&self) -> bool {
+        self.main_hub().bridge.is_connected()
+    }
+
+    pub fn device_briefs(&self) -> Vec<DeviceBrief> {
+        self.hubs
+            .iter()
+            .enumerate()
+            .map(|(i, h)| DeviceBrief {
+                name: h.name.clone(),
+                token: h.token.clone(),
+                connector_id: h.connector_id.clone(),
+                connected: h.bridge.is_connected(),
+                main: i == 0,
+            })
+            .collect()
     }
 }

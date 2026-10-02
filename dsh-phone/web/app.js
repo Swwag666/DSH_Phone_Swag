@@ -18,6 +18,7 @@ let currentModelId = null;
 let currentPermissionId = null;
 let pendingAttachments = [];
 let turnHadError = false;
+let turnT0 = 0;
 let readUpTo = (() => { try { return JSON.parse(localStorage.getItem("dsh-phone-read") || "{}"); } catch (_) { return {}; } })();
 
 function orderTs(s) {
@@ -134,7 +135,9 @@ function tryAuth(t) {
       show("view-list");
       return true;
     }
-    lastError = "токен не подошёл или гейтвей недоступен";
+    lastError = (r.error === "bridge_disconnected")
+      ? "мост этого устройства ещё подключается — повтори через пару секунд"
+      : "токен не подошёл или гейтвей недоступен";
     $("auth-err").textContent = lastError;
     return false;
   }).catch((e) => {
@@ -356,6 +359,7 @@ function retryLast() {
   if (!activeSession || !lastUserText) return;
   turnHadError = false;
   allowTw = true;
+  turnT0 = Date.now();
   status("повтор хода…");
   api("session.startTurn", { sessionId: activeSession, content: lastUserText }).then((r) => {
     status(r.ok ? "повторяю, жду ответ…" : "ошибка: " + (r.error || "?"));
@@ -790,6 +794,7 @@ $("composer").onsubmit = (e) => {
   autoGrow();
   turnHadError = false;
   allowTw = true;
+  turnT0 = Date.now();
   const atts = pendingAttachments.slice();
   pendingAttachments = [];
   renderChips();
@@ -1058,6 +1063,249 @@ function readFileBase64(file) {
   });
 }
 
+// ---------- camera ----------
+$("cam").onclick = () => $("cam-input").click();
+$("cam-input").addEventListener("change", (e) => handleFiles(e.target.files));
+
+// ---------- voice input (Web Speech API) ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+let recog = null, recActive = false, recBase = "";
+
+if (!SR) {
+  $("mic").style.display = "none";
+} else {
+  $("mic").onclick = () => {
+    if (recActive) { try { recog.stop(); } catch (_) {} return; }
+    if (!window.isSecureContext) { status("голосу нужен https — включи TLS на узле"); return; }
+    startVoice();
+  };
+}
+
+function startVoice() {
+  recActive = true;
+  recBase = $("input").value ? $("input").value.replace(/\s+$/, "") + " " : "";
+  $("mic").classList.add("rec");
+  recog = new SR();
+  const navLang = (navigator.language || "ru").toLowerCase();
+  recog.lang = navLang.startsWith("ru") ? "ru-RU" : (navigator.language || "ru-RU");
+  recog.continuous = false;
+  recog.interimResults = true;
+  recog.onresult = (e) => {
+    let interim = "", fin = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) fin += r[0].transcript; else interim += r[0].transcript;
+    }
+    if (fin) recBase += fin + " ";
+    $("input").value = recBase + interim;
+    autoGrow();
+    if (interim) status("слышу: " + interim.slice(0, 60));
+  };
+  recog.onend = () => {
+    recActive = false;
+    $("mic").classList.remove("rec");
+    $("input").value = recBase;
+    autoGrow();
+    status("запись закончена");
+    try { $("input").focus(); } catch (_) {}
+  };
+  recog.onerror = (e) => {
+    recActive = false;
+    $("mic").classList.remove("rec");
+    status("микрофон: " + e.error);
+  };
+  try { recog.start(); status("говори…"); } catch (e) { status("микрофон: " + (e.error || "занят")); }
+}
+
+// ---------- session stats ----------
+function statsKey(sid) { return "dsh-phone-stats-" + sid; }
+
+function loadStats(sid) {
+  try { return JSON.parse(localStorage.getItem(statsKey(sid)) || "{}") || {}; } catch (_) { return {}; }
+}
+
+function saveStats(sid, st) {
+  try { localStorage.setItem(statsKey(sid), JSON.stringify(st)); } catch (_) {}
+}
+
+function bumpStat(sid, patch) {
+  const st = loadStats(sid);
+  for (const k in patch) st[k] = (st[k] || 0) + patch[k];
+  saveStats(sid, st);
+}
+
+function fmtDur(ms) {
+  const s = ms / 1000;
+  if (s < 60) return s.toFixed(1) + "с";
+  const m = Math.floor(s / 60);
+  return m + "м " + ("0" + Math.floor(s % 60)).slice(-2) + "с";
+}
+
+function fmtNum(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return String(Math.round(n));
+}
+
+function fmtCost(usd) {
+  if (usd < 0.01) return "$" + (usd * 100).toFixed(1) + "c";
+  return "$" + usd.toFixed(usd < 1 ? 3 : 2);
+}
+
+// тариф deepseek-чат на 1M токенов: вход/выход
+const PRICE_IN = 0.27, PRICE_OUT = 1.10;
+
+function findUsage(it) {
+  if (!it || typeof it !== "object") return null;
+  const cands = [it.usage, it.stats, it.credits, it.metadata && it.metadata.usage];
+  const c = it.content;
+  if (c && typeof c === "object") cands.push(c.usage, c.credits, c.metadata && c.metadata.usage);
+  for (const u of cands) {
+    if (!u || typeof u !== "object") continue;
+    const pin = u.promptTokens ?? u.input_tokens ?? u.inputTokens ?? u.prompt_tokens;
+    const pout = u.completionTokens ?? u.output_tokens ?? u.outputTokens ?? u.completion_tokens;
+    if (typeof pin === "number" || typeof pout === "number") {
+      return {
+        in: typeof pin === "number" ? pin : 0,
+        out: typeof pout === "number" ? pout : 0,
+      };
+    }
+  }
+  return null;
+}
+
+function harvestUsage(ordered) {
+  let inT = 0, outT = 0, found = false;
+  for (const it of ordered) {
+    const u = findUsage(it);
+    if (u) { found = true; inT += u.in; outT += u.out; }
+  }
+  return { inT, outT, found };
+}
+
+function orderedItems() {
+  return [...items.values()].sort((a, b) => (a.orderSeq || 0) - (b.orderSeq || 0)).filter((it) => !isBookkeeping(it));
+}
+
+function refreshStats() {
+  const el = $("menu-stats");
+  if (!el) return;
+  if (!activeSession) {
+    el.innerHTML = '<div class="menu-row"><span>открой чат</span><span>—</span></div>';
+    return;
+  }
+  const ordered = orderedItems();
+  const userN = ordered.filter((it) => it.role === "user").length;
+  const asstN = ordered.filter((it) => it.role === "assistant").length;
+  const st = loadStats(activeSession);
+  const avg = st.turns ? st.turnMs / st.turns : 0;
+  const u = harvestUsage(ordered);
+  let tokLine, costLine;
+  if (u.found && (u.inT || u.outT)) {
+    tokLine = fmtNum(u.inT) + " вх / " + fmtNum(u.outT) + " вых";
+    costLine = fmtCost(u.inT * PRICE_IN / 1e6 + u.outT * PRICE_OUT / 1e6) + " · deepseek-тариф";
+  } else {
+    let chars = 0;
+    for (const it of ordered) {
+      if (it.role === "user" || it.role === "assistant") chars += (itemText(it)[1] || "").length;
+    }
+    const approx = Math.round(chars / 4);
+    tokLine = "≈ " + fmtNum(approx) + " · оценка";
+    costLine = "≈ " + fmtCost(approx * ((PRICE_IN + PRICE_OUT) / 2) / 1e6);
+  }
+  const row = (k, v) => '<div class="menu-row"><span>' + escapeHtml(k) + '</span><span>' + escapeHtml(v) + '</span></div>';
+  el.innerHTML =
+    row("ходов (мои)", String(userN)) +
+    row("ответов", String(asstN)) +
+    row("ср. ход", st.turns ? fmtDur(st.turnMs / st.turns) : (avg ? fmtDur(avg) : "—")) +
+    row("время при тебе", st.turns ? fmtDur(st.turnMs) : "—") +
+    row("токены", tokLine) +
+    row("стоимость", costLine);
+}
+
+window.dshMenuOpen = refreshStats;
+
+// ---------- export ----------
+function slugify(s) {
+  const base = cleanText(s).replace(/[^\wа-яА-ЯёЁ\- ]+/g, "").trim().replace(/\s+/g, "-").slice(0, 48);
+  const d = new Date();
+  const p = (n) => (n < 10 ? "0" + n : "" + n);
+  const stamp = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes());
+  return (base || "chat") + "-" + stamp;
+}
+
+function mdText(t) { return String(t == null ? "" : t).trim(); }
+
+function chatToMarkdown(title, s, ordered) {
+  const L = [];
+  L.push("# " + title);
+  if (s && s.cwd) L.push("", "> рабочая папка: `" + s.cwd + "`");
+  L.push("", "_DSH Phone · экспорт " + new Date().toLocaleString() + " · сообщений: " + ordered.length + "_", "", "---");
+  for (const it of ordered) {
+    const role = it.role || "system";
+    const t = itemText(it);
+    const ts = it.orderingTime ? " · " + new Date(it.orderingTime).toLocaleString() : "";
+    if (role === "user") { L.push("", "## Я" + ts, "", mdText(t[1])); }
+    else if (role === "assistant") { L.push("", "## Агент" + ts, "", mdText(t[1])); }
+    else if (t[0] === "tool") {
+      const raw = t[1] || "";
+      const nl = raw.indexOf("\n");
+      const head = mdText(nl >= 0 ? raw.slice(0, nl) : raw);
+      L.push("", "<details><summary>🔧 " + head + "</summary>", "", "```", raw, "```", "</details>");
+    }
+    else if (t[0] === "reasoning") { L.push("", "## Размышления" + ts, "", mdText(t[1])); }
+    else { L.push("", "## · система", "", mdText(t[1])); }
+  }
+  return L.join("\n") + "\n";
+}
+
+function downloadBlob(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch (_) {} }, 4000);
+  status("выгружено: " + name);
+}
+
+function shareOrDownload(blob, name) {
+  try {
+    const file = new File([blob], name, { type: blob.type });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      navigator.share({ files: [file], title: name }).then(() => status("отправлено: " + name)).catch(() => downloadBlob(blob, name));
+      return;
+    }
+  } catch (_) {}
+  downloadBlob(blob, name);
+}
+
+function exportChat(kind) {
+  if (!activeSession) { status("открой чат для экспорта"); return; }
+  const ordered = orderedItems();
+  if (!ordered.length) { status("чат пуст — нечего выгружать"); return; }
+  const s = sessions.find((x) => x.sessionId === activeSession);
+  const title = cleanText((s && (s.title || s.cwd)) || "чат");
+  const name = "dsh-" + slugify(title) + (kind === "json" ? ".json" : ".md");
+  let blob;
+  if (kind === "json") {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      app: "dsh-phone",
+      session: s || { sessionId: activeSession },
+      items: ordered,
+    };
+    blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  } else {
+    blob = new Blob([chatToMarkdown(title, s, ordered)], { type: "text/markdown" });
+  }
+  shareOrDownload(blob, name);
+}
+
+if ($("menu-export-md")) $("menu-export-md").onclick = () => exportChat("md");
+if ($("menu-export-json")) $("menu-export-json").onclick = () => exportChat("json");
+
 // ---------- events long-poll ----------
 function processEvent(ev) {
   if (ev.type === "bridge") { bridgeOn = ev.data.status === "connected"; $("status-dot").className = "dot " + (bridgeOn ? "on" : "off"); }
@@ -1069,6 +1317,12 @@ function processEvent(ev) {
   }
   else if (ev.type === "turnEnded") {
     const sid = ev.data && ev.data.sessionId;
+    if (sid === activeSession && turnT0) {
+      const dur = Date.now() - turnT0;
+      bumpStat(sid, { turnMs: dur, turns: 1 });
+      status("ход занял " + fmtDur(dur));
+      turnT0 = 0;
+    }
     const isActive = sid === activeSession;
     const err = isActive && turnHadError;
     notifyNow(err ? "Работа не закончена" : "Работа закончена", titleOf(sid) || "агент", "turn-" + (sid || "x"));

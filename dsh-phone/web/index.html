@@ -1,35 +1,35 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0a0a0d" />
   <title>DSH PHONE</title>
-  <link rel="manifest" href="/manifest.json?v=10" />
-  <link rel="stylesheet" href="/style.css?v=10" />
+  <link rel="manifest" href="/manifest.json?v=11" />
+  <link rel="stylesheet" href="/style.css?v=11" />
 </head>
 <body>
   <div id="app">
     <header id="topbar">
-      <button id="back" class="hidden">←</button>
+      <button id="back" class="hidden">в†ђ</button>
       <div class="top-title">DSH PHONE</div>
-      <button id="refresh" title="Обновить">⟳</button>
-      <button id="new-btn" title="Новый чат" class="hidden">+</button>
-      <button id="model-btn" class="hidden" title="Модель и доступ">⚙</button>
+      <button id="refresh" title="РћР±РЅРѕРІРёС‚СЊ">вџі</button>
+      <button id="new-btn" title="РќРѕРІС‹Р№ С‡Р°С‚" class="hidden">+</button>
+      <button id="model-btn" class="hidden" title="РњРѕРґРµР»СЊ Рё РґРѕСЃС‚СѓРї">вљ™</button>
       <button id="status-dot" class="dot off" title="bridge"></button>
-      <button id="menu-btn" title="Протокол">☰</button>
+      <button id="menu-btn" title="РџСЂРѕС‚РѕРєРѕР»">в°</button>
     </header>
 
     <section id="view-auth" class="view">
       <div class="auth-card">
-        <div class="auth-emblem">◆</div>
+        <div class="auth-emblem">в—†</div>
         <div class="auth-title">DSH PHONE</div>
-        <div class="auth-tag">порядок · честь · протокол</div>
-        <p>Предъяви ключ доступа. Он в файле <code>config.json</code> на ПК или в логе запуска узла.</p>
-        <input id="token-input" placeholder="ключ доступа" autocomplete="off" autocapitalize="off" autocorrect="off" />
-        <button id="auth-go">Предъявить ключ</button>
+        <div class="auth-tag">РїРѕСЂСЏРґРѕРє В· С‡РµСЃС‚СЊ В· РїСЂРѕС‚РѕРєРѕР»</div>
+        <p>РџСЂРµРґСЉСЏРІРё РєР»СЋС‡ РґРѕСЃС‚СѓРїР°. РћРЅ РІ С„Р°Р№Р»Рµ <code>config.json</code> РЅР° РџРљ РёР»Рё РІ Р»РѕРіРµ Р·Р°РїСѓСЃРєР° СѓР·Р»Р°.</p>
+        <input id="token-input" placeholder="РєР»СЋС‡ РґРѕСЃС‚СѓРїР°" autocomplete="off" autocapitalize="off" autocorrect="off" />
+        <button id="auth-go">РџСЂРµРґСЉСЏРІРёС‚СЊ РєР»СЋС‡</button>
         <div id="auth-err" class="err"></div>
-        <div class="auth-stamp">гриф: без свидетелей · сбор пассивный</div>
+        <div class="auth-stamp">РіСЂРёС„: Р±РµР· СЃРІРёРґРµС‚РµР»РµР№ В· СЃР±РѕСЂ РїР°СЃСЃРёРІРЅС‹Р№</div>
       </div>
     </section>
 
@@ -40,19 +40,22 @@
     <section id="view-chat" class="view hidden">
       <div id="chat-meta"></div>
       <div id="chat-items"></div>
-      <button id="jumplast" class="hidden" title="Вниз">↓</button>
+      <button id="jumplast" class="hidden" title="Р’РЅРёР·">в†“</button>
       <div id="approval"></div>
       <div id="attach-chips" class="hidden"></div>
       <div id="msgactions" class="hidden">
-        <button id="retry-btn" type="button" title="Повторить последний ход">↻ повторить</button>
-        <button id="edit-btn" type="button" title="Править последнее сообщение">✎ править</button>
+        <button id="retry-btn" type="button" title="РџРѕРІС‚РѕСЂРёС‚СЊ РїРѕСЃР»РµРґРЅРёР№ С…РѕРґ">в†» РїРѕРІС‚РѕСЂРёС‚СЊ</button>
+        <button id="edit-btn" type="button" title="РџСЂР°РІРёС‚СЊ РїРѕСЃР»РµРґРЅРµРµ СЃРѕРѕР±С‰РµРЅРёРµ">вњЋ РїСЂР°РІРёС‚СЊ</button>
       </div>
       <form id="composer">
-        <button id="attach" type="button" title="Добавить файл">📎</button>
+        <button id="cam" type="button" title="РЎРЅСЏС‚СЊ С„РѕС‚Рѕ">в–Ј</button>
+        <input id="cam-input" type="file" accept="image/*" capture="environment" hidden />
+        <button id="attach" type="button" title="Р”РѕР±Р°РІРёС‚СЊ С„Р°Р№Р»">рџ“Ћ</button>
         <input id="file-input" type="file" multiple hidden />
-        <textarea id="input" rows="1" placeholder="Сообщение…"></textarea>
-        <button id="send" type="submit">➤</button>
-        <button id="interrupt" type="button" title="Стоп">■</button>
+        <button id="mic" type="button" title="Р“РѕР»РѕСЃРѕРІРѕР№ РІРІРѕРґ">в—‰</button>
+        <textarea id="input" rows="1" placeholder="РЎРѕРѕР±С‰РµРЅРёРµвЂ¦"></textarea>
+        <button id="send" type="submit">вћ¤</button>
+        <button id="interrupt" type="button" title="РЎС‚РѕРї">в– </button>
       </form>
     </section>
 
@@ -61,10 +64,10 @@
 
   <div id="model-sheet" class="hidden">
     <div id="model-sheet-body">
-      <div id="model-sheet-head"><span>Модель и доступ</span><button id="model-close">✕</button></div>
-      <div class="sheet-sec">Модель</div>
+      <div id="model-sheet-head"><span>РњРѕРґРµР»СЊ Рё РґРѕСЃС‚СѓРї</span><button id="model-close">вњ•</button></div>
+      <div class="sheet-sec">РњРѕРґРµР»СЊ</div>
       <div id="model-list"></div>
-      <div class="sheet-sec">Доступ</div>
+      <div class="sheet-sec">Р”РѕСЃС‚СѓРї</div>
       <div id="perm-list"></div>
       <div id="model-current"></div>
     </div>
@@ -72,75 +75,79 @@
 
   <div id="new-sheet" class="hidden">
     <div id="new-sheet-body">
-      <div id="new-sheet-head"><span>Новый чат</span><button id="new-close">✕</button></div>
-      <div class="sheet-sec">Папка</div>
-      <input id="new-cwd" list="ws-list" placeholder="C:\путь\к\папке" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <div id="new-sheet-head"><span>РќРѕРІС‹Р№ С‡Р°С‚</span><button id="new-close">вњ•</button></div>
+      <div class="sheet-sec">РџР°РїРєР°</div>
+      <input id="new-cwd" list="ws-list" placeholder="C:\РїСѓС‚СЊ\Рє\РїР°РїРєРµ" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
       <datalist id="ws-list"></datalist>
-      <div class="sheet-sec">Первое сообщение</div>
-      <textarea id="new-text" rows="2" placeholder="привет (можно оставить пустым)"></textarea>
-      <button id="new-create">Создать</button>
+      <div class="sheet-sec">РџРµСЂРІРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ</div>
+      <textarea id="new-text" rows="2" placeholder="РїСЂРёРІРµС‚ (РјРѕР¶РЅРѕ РѕСЃС‚Р°РІРёС‚СЊ РїСѓСЃС‚С‹Рј)"></textarea>
+      <button id="new-create">РЎРѕР·РґР°С‚СЊ</button>
       <div id="new-err" class="err"></div>
     </div>
   </div>
 
   <div id="menu-sheet" class="hidden">
     <div id="menu-sheet-body">
-      <div id="menu-head"><span>Протокол</span><button id="menu-close">✕</button></div>
+      <div id="menu-head"><span>РџСЂРѕС‚РѕРєРѕР»</span><button id="menu-close">вњ•</button></div>
       <div class="menu-brand">
-        <div class="menu-emblem">◆</div>
+        <div class="menu-emblem">в—†</div>
         <div>
           <div class="menu-title">DSH PHONE</div>
-          <div class="menu-sub">узел личной связи · без свидетелей</div>
+          <div class="menu-sub">СѓР·РµР» Р»РёС‡РЅРѕР№ СЃРІСЏР·Рё В· Р±РµР· СЃРІРёРґРµС‚РµР»РµР№</div>
         </div>
       </div>
-      <div class="sheet-sec">Связь</div>
-      <div id="menu-info" class="menu-info">…</div>
-      <div class="sheet-sec">Фишки</div>
-      <div class="pick" id="menu-crt"><span>Экран-плёнка (CRT)</span><span id="crt-state">выкл</span></div>
-      <div class="sheet-sec">Действия</div>
-      <button class="pick menu-act" id="menu-reload">Перезагрузить узел</button>
-      <button class="pick menu-act menu-danger" id="menu-wipe">Стереть ключ доступа</button>
-      <div class="menu-foot" id="menu-time">фиксация …</div>
+      <div class="sheet-sec">РЎРІСЏР·СЊ</div>
+      <div id="menu-info" class="menu-info">вЂ¦</div>
+      <div class="sheet-sec">РЎС‚Р°С‚РёСЃС‚РёРєР°</div>
+      <div id="menu-stats" class="menu-info">РѕС‚РєСЂРѕР№ С‡Р°С‚</div>
+      <div class="sheet-sec">Р¤РёС€РєРё</div>
+      <div class="pick" id="menu-crt"><span>Р­РєСЂР°РЅ-РїР»С‘РЅРєР° (CRT)</span><span id="crt-state">РІС‹РєР»</span></div>
+      <div class="sheet-sec">Р”РµР№СЃС‚РІРёСЏ</div>
+      <button class="pick menu-act" id="menu-reload">РџРµСЂРµР·Р°РіСЂСѓР·РёС‚СЊ СѓР·РµР»</button>
+      <button class="pick menu-act" id="menu-export-md">Р’С‹РіСЂСѓР·РёС‚СЊ С‡Р°С‚ В· Markdown</button>
+      <button class="pick menu-act" id="menu-export-json">Р’С‹РіСЂСѓР·РёС‚СЊ С‡Р°С‚ В· JSON</button>
+      <button class="pick menu-act menu-danger" id="menu-wipe">РЎС‚РµСЂРµС‚СЊ РєР»СЋС‡ РґРѕСЃС‚СѓРїР°</button>
+      <div class="menu-foot" id="menu-time">С„РёРєСЃР°С†РёСЏ вЂ¦</div>
     </div>
   </div>
 
   <div class="scanlines"></div>
   <div class="crt-sweep"></div>
 
-  <script src="/app.js?v=10"></script>
+  <script src="/app.js?v=11"></script>
   <script>
     (function () {
       var $ = function (id) { return document.getElementById(id); };
       var menu = $("menu-sheet");
-      var open = function () { menu.classList.remove("hidden"); refreshInfo(); };
+      var open = function () { menu.classList.remove("hidden"); refreshInfo(); if (window.dshMenuOpen) window.dshMenuOpen(); };
       var close = function () { menu.classList.add("hidden"); };
       $("menu-btn").onclick = open;
       $("menu-close").onclick = close;
       menu.addEventListener("click", function (e) { if (e.target === menu) close(); });
 
       function fmtUptime(s) {
-        if (s < 60) return s + "с";
+        if (s < 60) return s + "СЃ";
         var m = Math.floor(s / 60);
-        if (m < 60) return m + "м " + (s % 60) + "с";
+        if (m < 60) return m + "Рј " + (s % 60) + "СЃ";
         var h = Math.floor(m / 60);
-        return h + "ч " + (m % 60) + "м";
+        return h + "С‡ " + (m % 60) + "Рј";
       }
       function refreshInfo() {
         fetch("/api/health").then(function (r) { return r.json(); }).then(function (h) {
           var on = h && h.bridge === "connected";
-          var html = '<div class="menu-row"><span>мост</span><span' + (on ? ' class="live"' : "") + '>' + (on ? "соединён" : "разорван") + "</span></div>";
-          html += '<div class="menu-row"><span>аптайм</span><span>' + (h ? fmtUptime(h.uptime || 0) : "—") + "</span></div>";
-          html += '<div class="menu-row"><span>запросов</span><span>' + (h ? (h.requests || 0) : "—") + "</span></div>";
+          var html = '<div class="menu-row"><span>РјРѕСЃС‚</span><span' + (on ? ' class="live"' : "") + '>' + (on ? "СЃРѕРµРґРёРЅС‘РЅ" : "СЂР°Р·РѕСЂРІР°РЅ") + "</span></div>";
+          html += '<div class="menu-row"><span>Р°РїС‚Р°Р№Рј</span><span>' + (h ? fmtUptime(h.uptime || 0) : "вЂ”") + "</span></div>";
+          html += '<div class="menu-row"><span>Р·Р°РїСЂРѕСЃРѕРІ</span><span>' + (h ? (h.requests || 0) : "вЂ”") + "</span></div>";
           $("menu-info").innerHTML = html;
         }).catch(function () {
-          $("menu-info").innerHTML = '<div class="menu-row"><span>мост</span><span>нет связи</span></div>';
+          $("menu-info").innerHTML = '<div class="menu-row"><span>РјРѕСЃС‚</span><span>РЅРµС‚ СЃРІСЏР·Рё</span></div>';
         });
       }
 
       function tick() {
         var d = new Date();
         var p = function (n) { return (n < 10 ? "0" : "") + n; };
-        $("menu-time").textContent = "фиксация " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+        $("menu-time").textContent = "С„РёРєСЃР°С†РёСЏ " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
       }
       setInterval(tick, 1000);
       tick();
@@ -148,7 +155,7 @@
       var crtOn = localStorage.getItem("dsh-crt") === "1";
       function applyCrt() {
         document.body.classList.toggle("crt-on", crtOn);
-        $("crt-state").textContent = crtOn ? "вкл" : "выкл";
+        $("crt-state").textContent = crtOn ? "РІРєР»" : "РІС‹РєР»";
       }
       $("menu-crt").onclick = function () {
         crtOn = !crtOn;

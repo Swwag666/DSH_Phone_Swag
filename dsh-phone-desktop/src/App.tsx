@@ -15,6 +15,8 @@ import {
   setStartHidden,
   setTlsEnabled,
   setAllowedIps,
+  addDevice,
+  removeDevice,
 } from "./lib/bridge";
 
 type Lang = "ru" | "en";
@@ -95,6 +97,16 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistApply: "применить",
     allowlistSaved: "список сохранён",
     fingerprint: "отпечаток серта",
+    devices: "Устройства",
+    devicesHint: "каждому телефону — свой ключ и своё окно агента в DSH",
+    deviceName: "имя телефона",
+    addDevice: "добавить",
+    deviceAdded: "устройство добавлено, узел перезапущен",
+    deviceRemoved: "устройство убрано, узел перезапущен",
+    devConfirm: "Убрать устройство? Его телефон сразу отвалится.",
+    devMain: "основное",
+    bridgeLive: "мост жив",
+    bridgeDown: "мост лежит",
   },
   en: {
     sub: "local bridge · phone ↔ PC",
@@ -171,6 +183,16 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistApply: "apply",
     allowlistSaved: "allowlist saved",
     fingerprint: "cert fingerprint",
+    devices: "Devices",
+    devicesHint: "every phone gets its own key and its own agent window in DSH",
+    deviceName: "phone name",
+    addDevice: "add",
+    deviceAdded: "device added, node restarted",
+    deviceRemoved: "device removed, node restarted",
+    devConfirm: "Remove the device? Its phone drops immediately.",
+    devMain: "main",
+    bridgeLive: "bridge live",
+    bridgeDown: "bridge down",
   },
 };
 
@@ -320,6 +342,7 @@ export default function App() {
   const [keyVisible, setKeyVisible] = useState(false);
   const [autostart, setAutostartState] = useState(false);
   const [ipList, setIpList] = useState("");
+  const [devName, setDevName] = useState("");
   const [toast, setToast] = useState("");
   const [lang, setLang] = useState<Lang>(() =>
     localStorage.getItem("dsh-lang") === "en" ? "en" : "ru"
@@ -395,6 +418,35 @@ export default function App() {
       fireToast(t("allowlistSaved"));
     } catch (e) {
       fireToast(t("errPrefix") + e);
+    }
+  };
+
+  const onAddDevice = async () => {
+    if (!devName.trim()) return;
+    setBusy(true);
+    try {
+      const c = await addDevice(devName.trim());
+      setCfg(c);
+      setDevName("");
+      fireToast(t("deviceAdded"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRemoveDevice = async (token: string) => {
+    if (!window.confirm(t("devConfirm"))) return;
+    setBusy(true);
+    try {
+      const c = await removeDevice(token);
+      setCfg(c);
+      fireToast(t("deviceRemoved"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -675,6 +727,92 @@ export default function App() {
                 </button>
               </div>
               <div className="mt-3 text-[11.5px] text-ash">{t("keyHint")}</div>
+
+              <div className="mt-4 border-t border-edge pt-3">
+                <div className="flex items-baseline justify-between mb-1">
+                  <div className="lbl">{t("devices")}</div>
+                  <div className="text-[10.5px] text-ash">{t("devicesHint")}</div>
+                </div>
+                <div className="divide-y divide-edge">
+                  {(status?.devices ?? []).map((d) => (
+                    <div key={d.token} className="py-2.5">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className={`shrink-0 inline-block w-1.5 h-1.5 rounded-full ${d.connected ? "bg-moss" : "bg-ash/50"}`}
+                          />
+                          <span className="text-[13px] text-bone truncate">{d.name}</span>
+                          {d.main && (
+                            <span className="shrink-0 text-[10px] uppercase tracking-wider text-ash border border-edge rounded-full px-2 py-0.5">
+                              {t("devMain")}
+                            </span>
+                          )}
+                          <span className="mono-badge text-[10.5px] text-ash truncate">{d.connector_id}</span>
+                        </div>
+                        <span className={`shrink-0 text-[11px] ${d.connected ? "text-moss" : "text-ash"}`}>
+                          {d.connected ? t("bridgeLive") : t("bridgeDown")}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 mt-1.5">
+                        <span
+                          className={`mono-badge text-[11px] text-blood break-all min-w-0 flex-1 ${keyVisible ? "" : "select-none"}`}
+                          style={{ filter: keyVisible ? "none" : "blur(4px)", transition: "filter .18s ease" }}
+                          title={keyVisible ? d.token : undefined}
+                        >
+                          {d.token}
+                        </span>
+                        <button
+                          onClick={async () =>
+                            fireToast((await copyText(d.token)) ? t("tKeyCopied") : t("tCopyFail"))
+                          }
+                          className="shrink-0 text-blood hover:text-ember transition p-1 rounded-sm hover:bg-blood/10"
+                          title={t("copyBtn")}
+                        >
+                          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                            <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                          </svg>
+                        </button>
+                        {!d.main && (
+                          <button
+                            onClick={() => onRemoveDevice(d.token)}
+                            disabled={busy}
+                            className="shrink-0 px-2 py-1 rounded-sm text-[11px] text-ash hover:text-blood hover:border-blood/40 border border-edge transition disabled:opacity-40"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {!(status?.devices ?? []).length && (
+                    <div className="py-2 text-[12px] text-ash">{running ? "…" : t("nodeOff")}</div>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 mt-2.5">
+                  <input
+                    value={devName}
+                    onChange={(e) => setDevName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        onAddDevice();
+                      }
+                    }}
+                    placeholder={t("deviceName")}
+                    spellCheck={false}
+                    className="flex-1 min-w-0 bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-blood/50 placeholder:text-ash/60 transition"
+                  />
+                  <button
+                    type="button"
+                    onClick={onAddDevice}
+                    disabled={busy || !devName.trim()}
+                    className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-blood border border-blood/40 hover:bg-blood/10 transition disabled:opacity-40"
+                  >
+                    + {t("addDevice")}
+                  </button>
+                </div>
+              </div>
             </section>
 
             {/* config card */}

@@ -122,6 +122,12 @@ button { cursor: pointer; font-family: inherit; }
 
 #attach { background: none; border: 0; color: #6f6f75; font-size: 20px; padding: 6px; }
 #attach:active { color: #cfcec6; }
+#cam { background: none; border: 0; color: #6f6f75; font-size: 19px; padding: 6px; }
+#cam:active { color: #cfcec6; }
+#mic { background: none; border: 0; color: #6f6f75; font-size: 19px; padding: 6px; }
+#mic:active { color: #cfcec6; }
+#mic.rec { color: #a84848; text-shadow: 0 0 10px rgba(168,72,72,.7); animation: micpulse 1.2s ease-in-out infinite; }
+@keyframes micpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 #attach-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px 0; border-top: 1px solid #1d1d23; }
 #msgactions { display: flex; gap: 8px; padding: 6px 10px 0; }
 #msgactions button { background: #141419; border: 1px solid #26262c; color: #9a8a8a; border-radius: 4px; padding: 4px 12px; font-size: 12.5px; cursor: pointer; }

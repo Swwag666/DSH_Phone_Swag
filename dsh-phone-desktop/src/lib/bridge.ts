@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface DeviceEntry {
+  name: string;
+  token: string;
+  connector_id: string;
+}
+
 export interface AppConfig {
   config_path: string;
   token: string;
@@ -12,6 +18,15 @@ export interface AppConfig {
   start_hidden?: boolean;
   tls_enabled?: boolean;
   allowed_ips?: string[];
+  devices?: DeviceEntry[];
+}
+
+export interface DeviceBrief {
+  name: string;
+  token: string;
+  connector_id: string;
+  connected: boolean;
+  main: boolean;
 }
 
 export interface ServerStatus {
@@ -20,6 +35,7 @@ export interface ServerStatus {
   uptime_seconds: number;
   requests: number;
   tls_sha256?: string | null;
+  devices?: DeviceBrief[];
 }
 
 export interface TailscaleStatus {
@@ -40,3 +56,5 @@ export const setAutostart = (enabled: boolean): Promise<boolean> => invoke("set_
 export const setStartHidden = (enabled: boolean): Promise<AppConfig> => invoke("set_start_hidden", { enabled });
 export const setTlsEnabled = (enabled: boolean): Promise<AppConfig> => invoke("set_tls_enabled", { enabled });
 export const setAllowedIps = (ips: string[]): Promise<AppConfig> => invoke("set_allowed_ips", { ips });
+export const addDevice = (name: string): Promise<AppConfig> => invoke("add_device", { name });
+export const removeDevice = (token: string): Promise<AppConfig> => invoke("remove_device", { token });
