@@ -184,7 +184,7 @@ pub fn encrypt_payload(
     let shared = secret.diffie_hellman(&client_pub);
     let ikm = shared.raw_secret_bytes();
 
-    // Random 16-byte header salt (RFC 8291 §2: salt feeds the second HKDF extract).
+    // Random 16-byte header salt (RFC 8291 В§2: salt feeds the second HKDF extract).
     let mut salt = [0u8; 16];
     use p256::elliptic_curve::rand_core::RngCore;
     OsRng.fill_bytes(&mut salt);
@@ -380,10 +380,6 @@ impl PushRouter {
         let _ = c.save();
     }
 
-    pub fn subscriptions_snapshot(&self) -> Vec<PushSubscription> {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        crate::config::AppConfig::load_or_init().push_subscriptions
-    }
 }
 
 fn reqwest_client() -> Result<reqwest::Client, String> {
@@ -403,7 +399,7 @@ async fn web_push_send(
     let body = encrypt_payload(sub, &notice.json())?;
     let auth = vapid_auth_header(vapid, &sub.endpoint)?;
     let ttl = if notice.session_id.is_some() { 3600u64 } else { 600 };
-    let urgency = if notice.title.contains("ответ") { "high" } else { "normal" };
+    let urgency = if notice.title.contains("РѕС‚РІРµС‚") { "high" } else { "normal" };
     let resp = client
         .post(&sub.endpoint)
         .header("TTL", ttl.to_string())
@@ -491,7 +487,7 @@ mod tests {
         let receiver_priv_hex = vapid.private_hex.clone();
         let auth = b64u().decode(sub.auth.as_bytes()).unwrap();
         let auth_hex = bytes_to_hex(&auth);
-        let payload = r#"{"title":"Ход завершён","body":"мост жив"}"#;
+        let payload = r#"{"title":"РҐРѕРґ Р·Р°РІРµСЂС€С‘РЅ","body":"РјРѕСЃС‚ Р¶РёРІ"}"#;
         let body = encrypt_payload(&sub, payload).unwrap();
         let back = decrypt_payload(&receiver_priv_hex, &auth_hex, &body).unwrap();
         assert_eq!(back, payload);
@@ -579,7 +575,7 @@ mod tests {
             auth: b64u_encode(&[9u8; 16]),
             created_at: 0.0,
         };
-        let our_payload = r#"{"title":"Нужен твой ответ","body":"интероп"}"#;
+        let our_payload = r#"{"title":"РќСѓР¶РµРЅ С‚РІРѕР№ РѕС‚РІРµС‚","body":"РёРЅС‚РµСЂРѕРї"}"#;
         let body = encrypt_payload(&sub, our_payload).unwrap();
         let input = serde_json::json!({
             "privHex": vapid.private_hex,
