@@ -65,3 +65,18 @@ export const setTlsEnabled = (enabled: boolean): Promise<AppConfig> => invoke("s
 export const setAllowedIps = (ips: string[]): Promise<AppConfig> => invoke("set_allowed_ips", { ips });
 export const addDevice = (name: string): Promise<AppConfig> => invoke("add_device", { name });
 export const removeDevice = (token: string): Promise<AppConfig> => invoke("remove_device", { token });
+
+export interface PushStatus {
+  subscriptions: number;
+  vapid_ready: boolean;
+  ntfy_enabled: boolean;
+  ntfy_url: string;
+  ntfy_topic: string;
+  ntfy_token: string;
+}
+export const pushStatus = (): Promise<PushStatus> => invoke("push_status");
+export const setNtfy = (enabled: boolean, url: string, topic: string, token: string): Promise<AppConfig> =>
+  invoke("set_ntfy", { enabled, url, topic, token });
+export const pushTest = (): Promise<{ ok: boolean; channels: { webpush: number; ntfy: boolean } }> =>
+  invoke("push_test");
+export const pushClear = (): Promise<PushStatus> => invoke("push_clear");

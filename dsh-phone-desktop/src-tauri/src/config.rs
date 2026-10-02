@@ -36,6 +36,32 @@ pub struct AppConfig {
     pub allowed_ips: Vec<String>,
     #[serde(default)]
     pub devices: Vec<DeviceEntry>,
+    #[serde(default)]
+    pub vapid_keys: Option<crate::push::VapidKeys>,
+    #[serde(default)]
+    pub push_subscriptions: Vec<crate::push::PushSubscription>,
+    #[serde(default)]
+    pub ntfy_enabled: bool,
+    #[serde(default, serialize_with = "ser_opt_string", deserialize_with = "de_opt_string")]
+    pub ntfy_url: Option<String>,
+    #[serde(default, serialize_with = "ser_opt_string", deserialize_with = "de_opt_string")]
+    pub ntfy_topic: Option<String>,
+    #[serde(default, serialize_with = "ser_opt_string", deserialize_with = "de_opt_string")]
+    pub ntfy_token: Option<String>,
+}
+
+fn ser_opt_string<S: serde::Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_deref().unwrap_or(""))
+}
+
+fn de_opt_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let s: Option<String> = Option::deserialize(d)?;
+    Ok(Some(s.unwrap_or_default()))
+}
+
+/// Random ntfy topic: unguessable in practice (a secret by itself).
+pub fn random_topic() -> String {
+    format!("dsh-{}", new_token())
 }
 
 fn default_bridge_endpoint() -> String {
@@ -142,6 +168,12 @@ impl AppConfig {
             tls_enabled: false,
             allowed_ips: Vec::new(),
             devices: Vec::new(),
+            vapid_keys: Some(crate::push::VapidKeys::generate()),
+            push_subscriptions: Vec::new(),
+            ntfy_enabled: false,
+            ntfy_url: None,
+            ntfy_topic: Some(random_topic()),
+            ntfy_token: None,
         }
     }
 
@@ -153,6 +185,12 @@ impl AppConfig {
                     Ok(mut c) => {
                         c.config_path = cp.to_string_lossy().to_string();
                         c.tailscale_ip = tailscale_ip();
+                        if c.vapid_keys.is_none() {
+                            c.vapid_keys = Some(crate::push::VapidKeys::generate());
+                        }
+                        if c.ntfy_topic.is_none() {
+                            c.ntfy_topic = Some(random_topic());
+                        }
                         let _ = c.save();
                         return c;
                     }

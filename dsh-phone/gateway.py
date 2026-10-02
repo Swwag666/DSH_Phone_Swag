@@ -44,6 +44,10 @@ DEFAULT_CONFIG = {
     ),
     "maxAttachmentBytes": 50 * 1024 * 1024,
     "allowedIps": [],
+    "ntfyEnabled": False,
+    "ntfyUrl": "",
+    "ntfyTopic": "",
+    "ntfyToken": "",
 }
 
 # Request guard rails: header count/size and body size caps so a single
@@ -88,6 +92,34 @@ class BadHttpRequest(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def ntfy_send(cfg, title, body):
+    """ntfy channel: plain HTTPS POST, no crypto needed (server-to-server)."""
+    if not cfg.get("ntfyEnabled"):
+        return
+    topic = cfg.get("ntfyTopic") or ""
+    if not topic:
+        return
+    try:
+        import urllib.request
+
+        url = (cfg.get("ntfyUrl") or "https://ntfy.sh").rstrip("/") + "/" + topic
+        data = json.dumps(
+            {"title": title, "message": body, "tags": ["speech_balloon"]}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}
+        )
+        tok = cfg.get("ntfyToken")
+        if tok:
+            req.add_header(
+                "Authorization",
+                "Basic " + base64.b64encode((":" + tok).encode("utf-8")).decode("ascii"),
+            )
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        pass
 
 RPC_WHITELIST = {
     "ping",
@@ -287,6 +319,23 @@ class Gateway:
             if not fut.done():
                 fut.set_result(None)
 
+    def session_label(self, sid):
+        for s in self.sessions:
+            if s.get("sessionId") == sid:
+                t = (s.get("title") or "").strip()
+                cwd = (s.get("cwd") or "").strip()
+                return t or cwd or "агент"
+        return "агент"
+
+    def notify(self, title, body):
+        # Blocking HTTP call - keep it off the event loop.
+        try:
+            asyncio.get_running_loop().create_task(
+                asyncio.to_thread(ntfy_send, self.cfg, title, body)
+            )
+        except RuntimeError:
+            pass
+
     # ---------------- sync feed (live notifications from the bridge) ----------------
     def _on_bridge_notify(self, msg):
         try:
@@ -312,6 +361,11 @@ class Gateway:
                                 if sid and it:
                                     self.push_event("items", {"sessionId": sid, "items": [it]})
                             elif m in ("session.turnEnded", "session.state", "session.meta.upsert", "session.capability.updated"):
+                                if m == "session.turnEnded":
+                                    sid = p.get("sessionId")
+                                    if sid:
+                                        self.push_event("turnEnded", {"sessionId": sid})
+                                        self.notify("Работа завершена", self.session_label(sid))
                                 refresh = True
                     elif kind == "timeline.upsert":
                         sid = op.get("sessionId")
@@ -437,6 +491,8 @@ class Gateway:
         if key != w.get("lastStateKey"):
             w["lastStateKey"] = key
             self.push_event("state", {"sessionId": sid, "state": st})
+            if st.get("status") == "waiting_approval":
+                self.notify("Нужен твой ответ", self.session_label(sid))
         # stream tail while working, and once after any state event
         status = st.get("status")
         if status in ("working", "waiting_approval"):
@@ -723,6 +779,9 @@ async def main():
         json.dump(cfg, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
     gw = Gateway(cfg)
+    if not cfg.get("ntfyTopic"):
+        cfg["ntfyTopic"] = "dsh-" + secrets.token_hex(8)
+        json.dump(cfg, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     server = await asyncio.start_server(
         lambda r, w: handle_http(r, w, gw), cfg["listenHost"], cfg["listenPort"]
     )

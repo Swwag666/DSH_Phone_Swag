@@ -318,6 +318,84 @@ async fn static_fallback(uri: Uri) -> Response {
     }
 }
 
+// ---------------- push subscriptions ----------------
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// Public info the PWA needs before subscribing (VAPID application server key).
+async fn push_info(State(gw): State<Arc<Gateway>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let token = q.get("token").cloned().unwrap_or_default();
+    if gw.find_hub(&token).is_none() {
+        return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false, "error": "unauthorized" }));
+    }
+    let vapid = crate::config::AppConfig::load_or_init()
+        .vapid_keys
+        .and_then(|v| hex_decode(&v.public_hex))
+        .map(|raw| {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+        });
+    json_status(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "vapid_public": vapid.unwrap_or_default(),
+        }),
+    )
+}
+
+#[allow(non_snake_case)]
+#[derive(Deserialize)]
+struct PushSubBody {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    p256dh: String,
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    device: String,
+}
+
+async fn push_subscribe(State(gw): State<Arc<Gateway>>, Json(b): Json<PushSubBody>) -> Response {
+    let hub = match gw.find_hub(&b.token) {
+        Some(h) => h,
+        None => return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false, "error": "unauthorized" })),
+    };
+    if b.endpoint.is_empty() || b.p256dh.is_empty() || b.auth.is_empty() {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "endpoint/p256dh/auth required" }));
+    }
+    let sub = crate::push::PushSubscription {
+        device: if b.device.is_empty() { hub.name.clone() } else { b.device.chars().take(40).collect() },
+        endpoint: b.endpoint,
+        p256dh: b.p256dh,
+        auth: b.auth,
+        created_at: now_ts(),
+    };
+    crate::push::PushRouter.add_subscription(sub);
+    json_status(StatusCode::OK, json!({ "ok": true }))
+}
+
+async fn push_unsubscribe(State(gw): State<Arc<Gateway>>, Json(b): Json<PushSubBody>) -> Response {
+    if gw.find_hub(&b.token).is_none() {
+        return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false, "error": "unauthorized" }));
+    }
+    if b.endpoint.is_empty() {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "endpoint required" }));
+    }
+    crate::push::PushRouter.remove_subscription(&b.endpoint);
+    json_status(StatusCode::OK, json!({ "ok": true }))
+}
+
 async fn count_reqs(State(gw): State<Arc<Gateway>>, req: Request, next: Next) -> Response {
     gw.requests.fetch_add(1, Ordering::Relaxed);
     next.run(req).await
@@ -342,6 +420,9 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
         .route("/api/watch", post(watch))
+        .route("/api/push/info", get(push_info))
+        .route("/api/push/subscribe", post(push_subscribe))
+        .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route(
             "/api/upload",
             post(upload).layer(DefaultBodyLimit::max(80 * 1024 * 1024)),

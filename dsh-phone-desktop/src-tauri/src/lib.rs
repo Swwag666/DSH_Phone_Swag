@@ -1,6 +1,7 @@
 mod bridge;
 mod config;
 mod gateway;
+mod push;
 mod pwa;
 mod server;
 mod tailscale;
@@ -300,6 +301,81 @@ fn set_tls_enabled(enabled: bool) -> config::AppConfig {
     c
 }
 
+#[derive(Serialize, Clone)]
+pub struct PushStatus {
+    pub subscriptions: usize,
+    pub vapid_ready: bool,
+    pub ntfy_enabled: bool,
+    pub ntfy_url: String,
+    pub ntfy_topic: String,
+    pub ntfy_token: String,
+}
+
+fn push_status_of() -> PushStatus {
+    let c = config::AppConfig::load_or_init();
+    PushStatus {
+        subscriptions: c.push_subscriptions.len(),
+        vapid_ready: c.vapid_keys.is_some(),
+        ntfy_enabled: c.ntfy_enabled,
+        ntfy_url: c.ntfy_url.clone().unwrap_or_default(),
+        ntfy_topic: c.ntfy_topic.clone().unwrap_or_default(),
+        ntfy_token: c.ntfy_token.clone().unwrap_or_default(),
+    }
+}
+
+#[tauri::command]
+fn push_status() -> PushStatus {
+    push_status_of()
+}
+
+/// ntfy channel settings. Empty url defaults to ntfy.sh; empty topic gets
+/// regenerated into a fresh random one.
+#[tauri::command]
+fn set_ntfy(enabled: bool, url: String, topic: String, token: String) -> config::AppConfig {
+    let mut c = config::AppConfig::load_or_init();
+    c.ntfy_enabled = enabled;
+    c.ntfy_url = Some(url.trim().to_string());
+    let t = topic.trim().to_string();
+    if t.is_empty() && c.ntfy_topic.as_deref().unwrap_or("").is_empty() {
+        c.ntfy_topic = Some(config::random_topic());
+    } else if !t.is_empty() {
+        c.ntfy_topic = Some(t);
+    }
+    c.ntfy_token = Some(token.trim().to_string());
+    let _ = c.save();
+    c
+}
+
+/// Fire a test notification through every enabled channel so the user can
+/// verify the phone side before trusting it.
+#[tauri::command]
+async fn push_test() -> Result<serde_json::Value, String> {
+    let st = push_status_of();
+    if !st.ntfy_enabled && st.subscriptions == 0 {
+        return Err("нет включённых каналов: включи ntfy или подпишись из PWA".into());
+    }
+    let notice = push::Notice {
+        title: "DSH Phone · тест".into(),
+        body: "канал жив - если видишь это, всё настроено".into(),
+        tag: "test".into(),
+        session_id: None,
+    };
+    push::PushRouter.dispatch(&notice);
+    Ok(serde_json::json!({
+        "ok": true,
+        "channels": {
+            "webpush": st.subscriptions,
+            "ntfy": st.ntfy_enabled,
+        }
+    }))
+}
+
+#[tauri::command]
+fn push_clear() -> PushStatus {
+    push::PushRouter.clear_subscriptions();
+    push_status_of()
+}
+
 fn show_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
@@ -344,6 +420,10 @@ pub fn run() {
             set_start_hidden,
             set_allowed_ips,
             set_tls_enabled,
+            set_ntfy,
+            push_status,
+            push_test,
+            push_clear,
             add_device,
             remove_device
         ])

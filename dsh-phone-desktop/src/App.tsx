@@ -3,6 +3,7 @@ import {
   AppConfig,
   ServerStatus,
   TailscaleStatus,
+  PushStatus,
   getConfig,
   regenerateToken,
   serverStatus,
@@ -18,6 +19,10 @@ import {
   setAllowedIps,
   addDevice,
   removeDevice,
+  pushStatus,
+  setNtfy,
+  pushTest,
+  pushClear,
 } from "./lib/bridge";
 
 type Lang = "ru" | "en";
@@ -100,6 +105,22 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
     allowlistApply: "применить",
     allowlistSaved: "список сохранён",
+    push: "Уведомления",
+    pushHint: "ход завершён / агент ждёт ответа - прилетает на телефон, даже когда PWA закрыта",
+    pushTest: "тест",
+    pushTestOk: "тест ушёл: webpush {n} · ntfy {on}",
+    pushNoChannels: "нет каналов: включи ntfy или подпишись из PWA",
+    webPush: "Web Push",
+    webPushHint: "подписка делается с телефона: PWA → меню ☰ → «пуши»",
+    pushClear: "сбросить",
+    pushCleared: "подписки сброшены",
+    ntfyLbl: "ntfy-канал",
+    ntfyHint: "сторонний канал без Google/Apple: ntfy-приложение на телефоне подписывается на топик",
+    ntfyUrlPh: "https://ntfy.sh",
+    ntfyTopicPh: "топик",
+    ntfyTokenPh: "токен (не обязателен)",
+    ntfyApply: "применить",
+    ntfySaved: "ntfy настроен",
     fingerprint: "отпечаток серта",
     devices: "Устройства",
     devicesHint: "каждому телефону — свой ключ и своё окно агента в DSH",
@@ -189,6 +210,22 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
     allowlistApply: "apply",
     allowlistSaved: "allowlist saved",
+    push: "Notifications",
+    pushHint: "turn finished / agent needs you - lands on the phone even with the PWA closed",
+    pushTest: "test",
+    pushTestOk: "test sent: webpush {n} · ntfy {on}",
+    pushNoChannels: "no channels on: enable ntfy or subscribe from the PWA",
+    webPush: "Web Push",
+    webPushHint: "subscribe from the phone: PWA → menu ☰ → «push»",
+    pushClear: "reset",
+    pushCleared: "subscriptions cleared",
+    ntfyLbl: "ntfy channel",
+    ntfyHint: "third channel without Google/Apple: the ntfy app subscribes to a topic",
+    ntfyUrlPh: "https://ntfy.sh",
+    ntfyTopicPh: "topic",
+    ntfyTokenPh: "token (optional)",
+    ntfyApply: "apply",
+    ntfySaved: "ntfy configured",
     fingerprint: "cert fingerprint",
     devices: "Devices",
     devicesHint: "every phone gets its own key and its own agent window in DSH",
@@ -350,6 +387,11 @@ export default function App() {
   const [autostart, setAutostartState] = useState(false);
   const [ipList, setIpList] = useState("");
   const [devName, setDevName] = useState("");
+  const [push, setPush] = useState<PushStatus | null>(null);
+  const [ntfyUrl, setNtfyUrl] = useState("");
+  const [ntfyTopic, setNtfyTopic] = useState("");
+  const [ntfyToken, setNtfyToken] = useState("");
+  const [pushBusy, setPushBusy] = useState(false);
   const [toast, setToast] = useState("");
   const [lang, setLang] = useState<Lang>(() =>
     localStorage.getItem("dsh-lang") === "en" ? "en" : "ru"
@@ -442,6 +484,64 @@ export default function App() {
     }
   };
 
+  const refreshPush = useCallback(() => {
+    pushStatus()
+      .then((p) => {
+        setPush(p);
+        setNtfyUrl((v) => (v ? v : p.ntfy_url));
+        setNtfyTopic((v) => (v ? v : p.ntfy_topic));
+        setNtfyToken((v) => (v ? v : p.ntfy_token));
+      })
+      .catch(() => {});
+  }, []);
+
+  const onToggleNtfy = async () => {
+    try {
+      const next = !(push?.ntfy_enabled);
+      await setNtfy(next, ntfyUrl, ntfyTopic, ntfyToken);
+      refreshPush();
+      fireToast(next ? t("ntfySaved") : t("ntfyLbl") + " off");
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+  };
+
+  const onSaveNtfy = async () => {
+    try {
+      await setNtfy(push?.ntfy_enabled ?? false, ntfyUrl, ntfyTopic, ntfyToken);
+      refreshPush();
+      fireToast(t("ntfySaved"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+  };
+
+  const onPushTest = async () => {
+    setPushBusy(true);
+    try {
+      const r = await pushTest();
+      fireToast(
+        t("pushTestOk")
+          .replace("{n}", String(r.channels.webpush))
+          .replace("{on}", r.channels.ntfy ? "on" : "off")
+      );
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const onPushClear = async () => {
+    try {
+      const p = await pushClear();
+      setPush(p);
+      fireToast(t("pushCleared"));
+    } catch (e) {
+      fireToast(t("errPrefix") + e);
+    }
+  };
+
   const onAddDevice = async () => {
     if (!devName.trim()) return;
     setBusy(true);
@@ -480,6 +580,7 @@ export default function App() {
       .catch((e) => fireToast(t("errPrefix") + e));
     refreshTailscale();
     getAutostart().then(setAutostartState).catch(() => {});
+    refreshPush();
     const poll = () => serverStatus().then(setStatus).catch(() => {});
     poll();
     const id = window.setInterval(poll, 2000);
@@ -915,6 +1016,86 @@ export default function App() {
                   <button type="button" onClick={onToggleTls} className={"toggle" + (cfg?.tls_enabled ? " on" : "")} aria-pressed={!!cfg?.tls_enabled}>
                     <span className="knob" />
                   </button>
+                </div>
+                <div className="py-2.5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[13px] text-bone">{t("push")}</div>
+                      <div className="text-[11.5px] text-ash">{t("pushHint")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onPushTest}
+                      disabled={pushBusy}
+                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-blood border border-blood/40 hover:bg-blood/10 transition disabled:opacity-40"
+                    >
+                      {t("pushTest")}
+                    </button>
+                  </div>
+                  <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-[11.5px] text-ash">
+                        {t("webPush")}:{" "}
+                        <span className="text-bone mono-badge">{push?.subscriptions ?? 0}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={onPushClear}
+                        disabled={(push?.subscriptions ?? 0) === 0}
+                        className="px-2 py-0.5 rounded-sm text-[10.5px] text-ash hover:text-blood border border-edge transition disabled:opacity-40"
+                      >
+                        {t("pushClear")}
+                      </button>
+                    </div>
+                    <div className="mt-1 text-[11px] text-ash/80">{t("webPushHint")}</div>
+                  </div>
+                  <div className="mt-2.5 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[13px] text-bone">{t("ntfyLbl")}</div>
+                      <div className="text-[11.5px] text-ash">{t("ntfyHint")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onToggleNtfy}
+                      className={"toggle" + (push?.ntfy_enabled ? " on" : "")}
+                      aria-pressed={!!push?.ntfy_enabled}
+                    >
+                      <span className="knob" />
+                    </button>
+                  </div>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <input
+                      value={ntfyUrl}
+                      onChange={(e) => setNtfyUrl(e.target.value)}
+                      placeholder={t("ntfyUrlPh")}
+                      spellCheck={false}
+                      className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                    />
+                    <input
+                      value={ntfyTopic}
+                      onChange={(e) => setNtfyTopic(e.target.value)}
+                      placeholder={t("ntfyTopicPh")}
+                      spellCheck={false}
+                      className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      value={ntfyToken}
+                      onChange={(e) => setNtfyToken(e.target.value)}
+                      placeholder={t("ntfyTokenPh")}
+                      spellCheck={false}
+                      type="password"
+                      className="flex-1 min-w-0 bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                    />
+                    <button
+                      type="button"
+                      onClick={onSaveNtfy}
+                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
+                    >
+                      {t("ntfyApply")}
+                    </button>
+                  </div>
                 </div>
                 <div className="py-2.5">
                   <div className="text-[13px] text-bone mb-0.5">{t("allowlist")}</div>

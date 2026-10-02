@@ -29,6 +29,12 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 rcgen = "0.13"
 rustls-pemfile = "2"
 
+# push notifications: Web Push (VAPID + RFC 8291 aes128gcm) and ntfy
+p256 = { version = "0.13", features = ["ecdsa", "ecdh", "arithmetic"] }
+hkdf = "0.12"
+aes-gcm = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

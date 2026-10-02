@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 
 use crate::bridge::Bridge;
+use crate::push::PushRouter;
 
 /// A single feed event as delivered to the phone: `{"ts", "type", "data"}`.
 #[derive(Clone)]
@@ -26,6 +27,7 @@ pub struct DeviceHub {
     refresh_pending: AtomicBool,
     event_buffer_max: usize,
     poll_seconds: f64,
+    push: PushRouter,
 }
 
 /// Сообщение, принятое на занятую сессию: ждёт освобождения агента.
@@ -83,6 +85,7 @@ impl DeviceHub {
         endpoint_path: String,
         event_buffer_max: usize,
         poll_seconds: f64,
+        push: PushRouter,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
         let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Value>();
         let (gen_tx, _) = watch::channel(0u64);
@@ -105,6 +108,7 @@ impl DeviceHub {
             refresh_pending: AtomicBool::new(false),
             event_buffer_max,
             poll_seconds,
+            push,
         });
         (hub, notify_rx)
     }
@@ -226,6 +230,32 @@ impl DeviceHub {
 
     pub fn gen_rx(&self) -> watch::Receiver<u64> {
         self.gen_tx.subscribe()
+    }
+
+    /// Human label for a session (title, else cwd, else "агент").
+    fn session_label(&self, sid: &str) -> String {
+        let st = self.state.lock().unwrap();
+        for s in st.sessions.iter() {
+            if s.get("sessionId").and_then(|v| v.as_str()) == Some(sid) {
+                let t = s
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let cwd = s.get("cwd").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                return t.or(cwd).unwrap_or("агент").to_string();
+            }
+        }
+        "агент".to_string()
+    }
+
+    /// Fire a push/ntfy notification for this hub's sessions.
+    fn push_notice(&self, title: &str, body: String, tag: String, sid: Option<String>) {
+        self.push.dispatch(&crate::push::Notice {
+            title: title.to_string(),
+            body,
+            tag,
+            session_id: sid,
+        });
     }
 
     fn push_event(&self, type_: &str, data: Value) {
@@ -434,6 +464,15 @@ impl DeviceHub {
         };
         if state_changed {
             self.push_event("state", json!({ "sessionId": sid, "state": stv }));
+            if status == "waiting_approval" {
+                let label = self.session_label(sid);
+                self.push_notice(
+                    "Нужен твой ответ",
+                    label,
+                    format!("appr-{sid}"),
+                    Some(sid.to_string()),
+                );
+            }
         }
         if matches!(
             status.as_str(),
@@ -568,6 +607,13 @@ impl DeviceHub {
                                             "turnEnded",
                                             json!({ "sessionId": sid2 }),
                                         );
+                                        let label = self.session_label(&sid2);
+                                        self.push_notice(
+                                            "Работа завершена",
+                                            label,
+                                            format!("turn-{sid2}"),
+                                            Some(sid2),
+                                        );
                                     }
                                     refresh = true;
                                 }
@@ -646,6 +692,7 @@ impl Gateway {
     ) -> (Arc<Self>, Vec<tauri::async_runtime::JoinHandle<()>>) {
         let mut hubs = Vec::new();
         let mut bg = Vec::new();
+        let push = crate::push::PushRouter::new();
 
         let (main, main_rx) = DeviceHub::new(
             "main".to_string(),
@@ -654,6 +701,7 @@ impl Gateway {
             cfg.bridge_endpoint_path.clone(),
             cfg.event_buffer_max,
             cfg.poll_seconds,
+            push.clone(),
         );
         bg.extend(main.start_background(main_rx));
         hubs.push(main);
@@ -666,6 +714,7 @@ impl Gateway {
                 cfg.bridge_endpoint_path.clone(),
                 cfg.event_buffer_max,
                 cfg.poll_seconds,
+                push.clone(),
             );
             bg.extend(hub.start_background(rx));
             hubs.push(hub);

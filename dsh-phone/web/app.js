@@ -1338,7 +1338,10 @@ function refreshStats() {
     row("стоимость", costLine);
 }
 
-window.dshMenuOpen = refreshStats;
+window.dshMenuOpen = function () {
+  refreshStats();
+  pushStateLabel();
+};
 
 // ---------- export ----------
 function slugify(s) {
@@ -1420,6 +1423,110 @@ function exportChat(kind) {
 
 if ($("menu-export-md")) $("menu-export-md").onclick = () => exportChat("md");
 if ($("menu-export-json")) $("menu-export-json").onclick = () => exportChat("json");
+
+// ---------- push notifications (Web Push, VAPID) ----------
+let pushSub = null;
+
+function b64ToUint8(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const base = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(base);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+// The SW re-subscribes on its own (pushsubscriptionchange) and needs the token,
+// which localStorage cannot provide to it - so we mirror it into IndexedDB.
+function idbSetToken() {
+  try {
+    const rq = indexedDB.open("dsh-phone", 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore("kv");
+    rq.onsuccess = () => {
+      const db = rq.result;
+      const tx = db.transaction("kv", "readwrite");
+      tx.objectStore("kv").put(token, "token");
+      tx.oncomplete = () => db.close();
+    };
+  } catch (_) {}
+}
+
+function pushStateLabel() {
+  const el = $("push-state");
+  if (!el) return;
+  if (!pushSupported()) { el.textContent = "браузер не умеет"; return; }
+  navigator.serviceWorker.ready
+    .then((reg) => reg.pushManager.getSubscription())
+    .then((s) => { pushSub = s || null; el.textContent = s ? "вкл" : "выкл"; })
+    .catch(() => { el.textContent = "?"; });
+}
+
+async function enablePush() {
+  if (!pushSupported()) { status("пуши: этот браузер не умеет"); return; }
+  let perm = "default";
+  try { perm = await Notification.requestPermission(); } catch (_) {}
+  if (perm !== "granted") { status("пуши: разрешение не дано"); return; }
+  const r = await fetch("/api/push/info?token=" + encodeURIComponent(token)).then((x) => x.json()).catch(() => null);
+  if (!r || !r.ok || !r.vapid_public) { status("пуши: узел не отдал ключ"); return; }
+  const reg = await navigator.serviceWorker.ready;
+  const old = await reg.pushManager.getSubscription();
+  if (old) { try { await old.unsubscribe(); } catch (_) {} }
+  try {
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: b64ToUint8(r.vapid_public),
+    });
+    const j = sub.toJSON();
+    const resp = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token,
+        endpoint: sub.endpoint,
+        p256dh: j.keys && j.keys.p256dh,
+        auth: j.keys && j.keys.auth,
+        device: (navigator.userAgent || "").slice(0, 40),
+      }),
+    }).then((x) => x.json());
+    if (!resp.ok) throw new Error(resp.error || "узел не принял подписку");
+    pushSub = sub;
+    idbSetToken();
+    status("пуши включены - узел постучит сам");
+  } catch (e) {
+    status("пуши: " + (e.message || "не подписалось"));
+  }
+  pushStateLabel();
+}
+
+async function disablePush() {
+  try {
+    let sub = pushSub;
+    if (!sub) {
+      const reg = await navigator.serviceWorker.ready;
+      sub = await reg.pushManager.getSubscription();
+    }
+    if (sub) {
+      const ep = sub.endpoint;
+      await sub.unsubscribe().catch(() => {});
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, endpoint: ep }),
+      }).catch(() => {});
+    }
+    pushSub = null;
+  } catch (_) {}
+  status("пуши выключены");
+  pushStateLabel();
+}
+
+if ($("menu-push")) {
+  $("menu-push").onclick = () => { if (pushSub) disablePush(); else enablePush(); };
+}
 
 // ---------- events long-poll ----------
 function processEvent(ev) {
