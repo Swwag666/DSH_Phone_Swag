@@ -116,17 +116,23 @@ button { cursor: pointer; font-family: inherit; }
   font: inherit; scrollbar-width: thin; scrollbar-color: #3a3a40 transparent;
 }
 #input:focus { border-color: #8a3838; outline: none; box-shadow: 0 0 0 1px rgba(138,56,56,.35); }
-#send { background: #8a3838; color: #e8dcd3; border: 0; border-radius: 6px; padding: 10px 16px; }
+#send { background: #8a3838; color: #e8dcd3; border: 0; border-radius: 6px; padding: 9px 14px; display: flex; align-items: center; justify-content: center; }
 #send:active { background: #a84848; }
-#interrupt { background: #4a1f1f; color: #e8dcd3; border: 0; border-radius: 6px; padding: 10px 12px; }
+#interrupt { background: #4a1f1f; color: #e8dcd3; border: 0; border-radius: 6px; padding: 9px 11px; display: flex; align-items: center; justify-content: center; }
 
-#attach { background: none; border: 0; color: #6f6f75; font-size: 20px; padding: 6px; }
-#attach:active { color: #cfcec6; }
-#cam { background: none; border: 0; color: #6f6f75; font-size: 19px; padding: 6px; }
-#cam:active { color: #cfcec6; }
-#mic { background: none; border: 0; color: #6f6f75; font-size: 19px; padding: 6px; }
-#mic:active { color: #cfcec6; }
-#mic.rec { color: #a84848; text-shadow: 0 0 10px rgba(168,72,72,.7); animation: micpulse 1.2s ease-in-out infinite; }
+.ico {
+  width: 20px; height: 20px; display: block;
+  fill: none; stroke: currentColor;
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+.ico-solid { fill: currentColor; stroke: none; }
+
+#attach, #cam, #mic {
+  background: none; border: 0; color: #6f6f75; padding: 7px;
+  display: flex; align-items: center; justify-content: center;
+}
+#attach:active, #cam:active, #mic:active { color: #cfcec6; }
+#mic.rec { color: #a84848; filter: drop-shadow(0 0 6px rgba(168,72,72,.6)); animation: micpulse 1.2s ease-in-out infinite; }
 @keyframes micpulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 #attach-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 10px 0; border-top: 1px solid #1d1d23; }
 #msgactions { display: flex; gap: 8px; padding: 6px 10px 0; }
