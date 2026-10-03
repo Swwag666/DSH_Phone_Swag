@@ -32,6 +32,8 @@ jobs:
         run: node dsh-phone/web/test-md.js
       - name: Run itemrender.js tests
         run: node dsh-phone/web/test-items.js
+      - name: Run draftsync.js tests
+        run: node dsh-phone/web/test-draft.js
 
   rust:
     name: Rust core tests

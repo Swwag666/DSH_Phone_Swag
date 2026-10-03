@@ -49,6 +49,18 @@ struct HubState {
     sessions_hash: String,
     watched: HashMap<String, Watched>,
     candidates: HashMap<String, Value>,
+    /// Input-field drafts shared between phone/web clients:
+    /// sessionId -> {text, origin, ts}
+    drafts: HashMap<String, DraftEntry>,
+    /// Last plugin heartbeat from the DSH Desktop side client.
+    plugin_ping: Option<Value>,
+}
+
+#[derive(Clone)]
+struct DraftEntry {
+    text: String,
+    origin: String,
+    ts: f64,
 }
 
 /// Snapshot row for status surfaces (desktop UI / health).
@@ -101,6 +113,8 @@ impl DeviceHub {
                 sessions_hash: String::new(),
                 watched: HashMap::new(),
                 candidates: HashMap::new(),
+                drafts: HashMap::new(),
+                plugin_ping: None,
             }),
             outbox: Mutex::new(Vec::new()),
             gen: AtomicU64::new(0),
@@ -211,6 +225,7 @@ impl DeviceHub {
                     .await
                 {
                     Ok(_) => {
+                        self.clear_draft(&item.session_id);
                         self.push_event("queued_flush", json!({ "sessionId": item.session_id }));
                     }
                     Err(_) => {
@@ -301,6 +316,116 @@ impl DeviceHub {
     pub async fn unwatch(&self, sid: &str) {
         let mut st = self.state.lock().unwrap();
         st.watched.remove(sid);
+    }
+
+    // ---------------- input-field draft sync ----------------
+
+    /// Map any accepted session identifier onto the bridge-side draft key:
+    /// sess_dsh_xxx stays as-is; a harness external id (session-uuid) resolves
+    /// through the live session list so DSH Desktop and the PWA share one slot.
+    pub fn resolve_draft_key(&self, sid: &str) -> String {
+        {
+            let st = self.state.lock().unwrap();
+            if st.drafts.contains_key(sid) {
+                return sid.to_string();
+            }
+            for s in &st.sessions {
+                if s.get("externalSessionId").and_then(|v| v.as_str()) == Some(sid) {
+                    if let Some(k) = s.get("sessionId").and_then(|v| v.as_str()) {
+                        return k.to_string();
+                    }
+                }
+            }
+        }
+        sid.to_string()
+    }
+
+    /// The harness-side external id for a bridge session, when known.
+    fn external_for(&self, sid: &str) -> Option<String> {
+        let st = self.state.lock().unwrap();
+        st.sessions
+            .iter()
+            .find(|s| s.get("sessionId").and_then(|v| v.as_str()) == Some(sid))
+            .and_then(|s| s.get("externalSessionId").and_then(|v| v.as_str()))
+            .map(|x| x.to_string())
+    }
+
+    /// Store one draft and push it to every connected client.
+    pub fn set_draft(&self, sid: &str, text: &str, origin: &str) {
+        let ts = now_ts();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.drafts.insert(
+                sid.to_string(),
+                DraftEntry {
+                    text: text.chars().take(10_000).collect(),
+                    origin: origin.chars().take(64).collect(),
+                    ts,
+                },
+            );
+            if st.drafts.len() > 64 {
+                let mut by_age: Vec<(f64, String)> = st
+                    .drafts
+                    .iter()
+                    .map(|(k, v)| (v.ts, k.clone()))
+                    .collect();
+                by_age.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let cut = by_age.len().saturating_sub(32);
+                for (_, k) in by_age.into_iter().take(cut) {
+                    st.drafts.remove(&k);
+                }
+            }
+        }
+        let ext = self.external_for(sid);
+        self.push_event(
+            "draft",
+            json!({
+                "sessionId": sid,
+                "externalSessionId": ext,
+                "text": text,
+                "origin": origin,
+                "ts": ts
+            }),
+        );
+    }
+
+    /// A sent message consumed the draft - wipe it on all clients.
+    pub fn clear_draft(&self, sid: &str) {
+        let had = {
+            let mut st = self.state.lock().unwrap();
+            st.drafts.remove(sid).is_some()
+        };
+        if had {
+            let ext = self.external_for(sid);
+            self.push_event(
+                "draft",
+                json!({
+                    "sessionId": sid,
+                    "externalSessionId": ext,
+                    "text": "",
+                    "origin": "",
+                    "ts": now_ts()
+                }),
+            );
+        }
+    }
+
+    pub fn get_draft(&self, sid: &str) -> Value {
+        let st = self.state.lock().unwrap();
+        match st.drafts.get(sid) {
+            Some(d) => json!({ "text": d.text, "origin": d.origin, "ts": d.ts }),
+            None => json!({ "text": "", "origin": "", "ts": 0.0 }),
+        }
+    }
+
+    /// Plugin heartbeat storage: the DSH Desktop side client reports whether
+    /// it bound a session id and found the composer input.
+    pub fn set_plugin_ping(&self, payload: Value) {
+        self.state.lock().unwrap().plugin_ping = Some(payload);
+    }
+
+    pub fn plugin_ping_snapshot(&self) -> Option<Value> {
+        self.state.lock().unwrap().plugin_ping.clone()
     }
 
     // ---------------- background loops ----------------
@@ -459,7 +584,8 @@ impl DeviceHub {
             }
         };
         if state_changed {
-            self.push_event("state", json!({ "sessionId": sid, "state": stv }));
+            let ext = self.external_for(sid);
+            self.push_event("state", json!({ "sessionId": sid, "externalSessionId": ext, "state": stv }));
             if status == "waiting_approval" {
                 let label = self.session_label(sid);
                 self.push_notice(
@@ -518,7 +644,8 @@ impl DeviceHub {
                 }
             }
             if !fresh.is_empty() {
-                self.push_event("items", json!({ "sessionId": sid, "items": fresh }));
+                let ext = self.external_for(sid);
+                self.push_event("items", json!({ "sessionId": sid, "externalSessionId": ext, "items": fresh }));
             }
         }
     }
@@ -586,9 +713,12 @@ impl DeviceHub {
                                         .map(|s| s.to_string());
                                     let it = p.get("item").cloned();
                                     if let (Some(sid2), Some(it)) = (sid2, it) {
+                                        // externalSessionId lets the DSH-side plugin track the
+                                        // active harness session without fetch sniffing
+                                        let ext = self.external_for(&sid2);
                                         self.push_event(
                                             "items",
-                                            json!({ "sessionId": sid2, "items": [it] }),
+                                            json!({ "sessionId": sid2, "externalSessionId": ext, "items": [it] }),
                                         );
                                     }
                                 }
@@ -598,9 +728,10 @@ impl DeviceHub {
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string())
                                     {
+                                        let ext = self.external_for(&sid2);
                                         self.push_event(
                                             "turnEnded",
-                                            json!({ "sessionId": sid2 }),
+                                            json!({ "sessionId": sid2, "externalSessionId": ext }),
                                         );
                                         let label = self.session_label(&sid2);
                                         self.push_notice(
@@ -632,7 +763,11 @@ impl DeviceHub {
                             .unwrap_or_default();
                         if let Some(sid2) = sid2 {
                             if !its.is_empty() {
-                                self.push_event("items", json!({ "sessionId": sid2, "items": its }));
+                                let ext = self.external_for(&sid2);
+                                self.push_event(
+                                    "items",
+                                    json!({ "sessionId": sid2, "externalSessionId": ext, "items": its }),
+                                );
                             }
                         }
                     }
@@ -753,6 +888,99 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_hub() -> Arc<DeviceHub> {
+        let (hub, _rx) = DeviceHub::new(
+            "test".into(),
+            "tok".into(),
+            "conn".into(),
+            "C:/nonexistent/endpoint.json".into(),
+            64,
+            1.0,
+        );
+        hub
+    }
+
+    #[test]
+    fn draft_roundtrip_and_clear() {
+        let hub = test_hub();
+        assert_eq!(hub.get_draft("s1")["text"].as_str().unwrap(), "");
+        hub.set_draft("s1", "привет из поля", "dev-1");
+        assert_eq!(hub.get_draft("s1")["text"].as_str().unwrap(), "привет из поля");
+        assert_eq!(hub.get_draft("s1")["origin"].as_str().unwrap(), "dev-1");
+        hub.clear_draft("s1");
+        assert_eq!(hub.get_draft("s1")["text"].as_str().unwrap(), "");
+        // clearing an absent draft must not panic or push anything
+        hub.clear_draft("s1");
+    }
+
+    #[test]
+    fn draft_text_is_capped() {
+        let hub = test_hub();
+        let long = "x".repeat(20_000);
+        hub.set_draft("s2", &long, "dev-2");
+        assert_eq!(hub.get_draft("s2")["text"].as_str().unwrap().len(), 10_000);
+    }
+
+    #[test]
+    fn draft_map_stays_bounded() {
+        let hub = test_hub();
+        for i in 0..80 {
+            hub.set_draft(&format!("s{i}"), "t", "d");
+        }
+        let n = hub.state.lock().unwrap().drafts.len();
+        assert!(n <= 64, "draft map grew to {n}");
+    }
+
+    #[test]
+    fn draft_key_resolves_external_id_to_bridge_id() {
+        let hub = test_hub();
+        {
+            let mut st = hub.state.lock().unwrap();
+            st.sessions.push(json!({
+                "sessionId": "sess_dsh_aaa",
+                "externalSessionId": "session-1111-2222"
+            }));
+        }
+        // external (harness) id maps onto the bridge key
+        assert_eq!(hub.resolve_draft_key("session-1111-2222"), "sess_dsh_aaa");
+        // bridge ids pass through untouched
+        assert_eq!(hub.resolve_draft_key("sess_dsh_bbb"), "sess_dsh_bbb");
+        // unknown ids pass through so PWA behavior is unchanged
+        assert_eq!(hub.resolve_draft_key("whatever"), "whatever");
+    }
+
+    #[test]
+    fn draft_events_carry_external_id() {
+        let hub = test_hub();
+        {
+            let mut st = hub.state.lock().unwrap();
+            st.sessions.push(json!({
+                "sessionId": "sess_dsh_ccc",
+                "externalSessionId": "session-3333"
+            }));
+        }
+        hub.set_draft("sess_dsh_ccc", "хай", "dsh-desktop");
+        let st = hub.state.lock().unwrap();
+        let ev = st
+            .events
+            .iter()
+            .rev()
+            .find(|e| e.0.get("type").and_then(|t| t.as_str()) == Some("draft"))
+            .expect("draft event pushed");
+        assert_eq!(ev.0["data"]["externalSessionId"].as_str().unwrap(), "session-3333");
+        assert_eq!(ev.0["data"]["sessionId"].as_str().unwrap(), "sess_dsh_ccc");
+    }
+
+    #[test]
+    fn plugin_ping_roundtrip() {
+        let hub = test_hub();
+        assert!(hub.plugin_ping_snapshot().is_none());
+        hub.set_plugin_ping(json!({ "origin": "dsh-desktop", "hasSession": true, "sessionId": "session-x" }));
+        let snap = hub.plugin_ping_snapshot().expect("ping stored");
+        assert_eq!(snap["hasSession"].as_bool().unwrap(), true);
+        assert_eq!(snap["sessionId"].as_str().unwrap(), "session-x");
+    }
 
     #[test]
     fn token_eq_matches_identical() {

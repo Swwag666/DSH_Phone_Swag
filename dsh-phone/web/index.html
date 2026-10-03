@@ -8,8 +8,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="DSH" />
   <title>DSH PHONE</title>
-  <link rel="manifest" href="/manifest.json?v=16" />
-  <link rel="stylesheet" href="/style.css?v=16" />
+  <link rel="manifest" href="/manifest.json?v=19" />
+  <link rel="stylesheet" href="/style.css?v=19" />
 </head>
 <body>
   <div id="app">
@@ -46,6 +46,7 @@
       <button id="jumplast" class="hidden" title="Вниз">↓</button>
       <div id="approval"></div>
       <div id="attach-chips" class="hidden"></div>
+      <div id="draft-pill">⇄ черновик синхронизирован</div>
       <div id="msgactions" class="hidden">
         <button id="retry-btn" type="button" title="Повторить последний ход">↻ повторить</button>
         <button id="edit-btn" type="button" title="Править последнее сообщение">✎ править</button>
@@ -143,9 +144,10 @@
   <div class="scanlines"></div>
   <div class="crt-sweep"></div>
 
-  <script src="/md.js?v=16"></script>
-  <script src="/itemrender.js?v=16"></script>
-  <script src="/app.js?v=16"></script>
+  <script src="/md.js?v=19"></script>
+  <script src="/itemrender.js?v=19"></script>
+  <script src="/draftsync.js?v=19"></script>
+  <script src="/app.js?v=19"></script>
   <script>
     (function () {
       var $ = function (id) { return document.getElementById(id); };
