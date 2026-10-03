@@ -23,3 +23,6 @@ releases/dsh-phone-old.exe
 
 __pycache__/
 *.pyc
+
+# private session dumps / scratch
+tmp/
