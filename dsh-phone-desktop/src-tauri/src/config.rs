@@ -609,7 +609,7 @@ mod tests {
     /// Токен вида "aaaa..." - заведомо не секрет, но по формату совпадает с
     /// тем, что кладёт new_token() (32 символа).
     fn fake_token(seed: char) -> String {
-        std::iter::repeat(seed).take(32).collect()
+        std::iter::repeat_n(seed, 32).collect()
     }
 
     fn fake_hex(seed: &str, len: usize) -> String {

@@ -47,6 +47,18 @@ export interface TailscaleStatus {
   dns_name?: string | null;
 }
 
+/**
+ * QR-карточка для подключения телефона. `token` — тот же ключ, что в `#t=...`:
+ * намеренно отдаётся фронту, иначе QR не собрать. Показываем его только в
+ * дашборде на самом ПК, в подпись под кодом не выводим.
+ */
+export interface QrPayload {
+  url: string;
+  svg: string;
+  address: string;
+  token: string;
+}
+
 export const getConfig = (): Promise<AppConfig> => invoke("app_config");
 export const regenerateToken = (): Promise<AppConfig> => invoke("regenerate_token");
 export const serverStatus = (): Promise<ServerStatus> => invoke("server_status");
@@ -66,6 +78,27 @@ export const setAutostart = (enabled: boolean): Promise<boolean> => invoke("set_
 export const setStartHidden = (enabled: boolean): Promise<AppConfig> => invoke("set_start_hidden", { enabled });
 export const setTlsEnabled = (enabled: boolean): Promise<AppConfig> => invoke("set_tls_enabled", { enabled });
 export const tlsExportCa = (): Promise<string> => invoke("tls_export_ca");
+export const connectQr = (): Promise<QrPayload> => invoke("connect_qr");
+
+/** Результат проверки обновлений. `error` заполнен, когда релизы не достучались. */
+export interface UpdateInfo {
+  available: boolean;
+  version: string | null;
+  current: string;
+  notes: string | null;
+  error: string | null;
+}
+
+/** Прогресс скачивания, приходит событием `update-progress`. */
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+  percent: number | null;
+}
+
+export const updateCheck = (): Promise<UpdateInfo> => invoke("update_check");
+export const updateInstall = (): Promise<string> => invoke("update_install");
+export const restartApp = (): Promise<void> => invoke("restart_app");
 export const setAllowedIps = (ips: string[]): Promise<AppConfig> => invoke("set_allowed_ips", { ips });
 export const addDevice = (name: string): Promise<AppConfig> => invoke("add_device", { name });
 export const removeDevice = (token: string): Promise<AppConfig> => invoke("remove_device", { token });

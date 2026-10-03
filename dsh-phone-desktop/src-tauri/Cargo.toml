@@ -4,7 +4,9 @@ version = "0.3.0"
 description = "DSH Phone - local bridge between DSH Desktop and your phone"
 authors = ["Rustvy"]
 edition = "2021"
-rust-version = "1.77"
+# 1.77 был устаревшим и заставлял cargo тянуть RC-версии tauri-plugin-*:
+# стабильные 2.x объявляют rust-version 1.90. Пин ниже - честный MSRV сборки.
+rust-version = "1.90"
 
 [lib]
 name = "dsh_phone_lib"
@@ -40,9 +42,17 @@ p256 = { version = "0.13", features = ["ecdsa", "ecdh", "arithmetic"] }
 hkdf = "0.12"
 aes-gcm = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json"] }
+# автообновление из GitHub Releases; рестарт после установки делает ядро tauri
+# (request_restart), поэтому отдельный process-плагин не нужен
+tauri-plugin-updater = "2"
+# QR для подключения телефона (svg-рендер, без image-зависимостей)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [profile.release]
 codegen-units = 1
 lto = true
 strip = true
 opt-level = 3
+
+[dev-dependencies]
+minisign-verify = "0.2.5"

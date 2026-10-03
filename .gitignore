@@ -21,6 +21,13 @@ shot_*.png
 shots/
 releases/dsh-phone-old.exe
 
+# ключи подписи автообновления. Рабочий ключ живёт в ~/.dsh-phone-updater
+# (вне репозитория), эти правила - страховка от случайного коммита.
+*.key
+*.key.pub
+*signing*private*
+password.txt
+
 __pycache__/
 *.pyc
 

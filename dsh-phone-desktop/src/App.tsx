@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   AppConfig,
   ServerStatus,
   TailscaleStatus,
   PushStatus,
+  QrPayload,
+  UpdateInfo,
+  UpdateProgress,
   getConfig,
   regenerateToken,
   serverStatus,
@@ -17,6 +21,10 @@ import {
   setStartHidden,
   setTlsEnabled,
   tlsExportCa,
+  connectQr,
+  updateCheck,
+  updateInstall,
+  restartApp,
   setAllowedIps,
   addDevice,
   removeDevice,
@@ -107,6 +115,28 @@ const dict: Record<Lang, Record<string, string>> = {
     tlsCaExported: "CA сохранён на рабочий стол",
     tlsCaFailed: "не удалось сохранить CA",
     tlsCaHint: "файл dsh-phone-ca.pem на рабочем столе — поставь его на телефон один раз: iOS через «Профиль» (Настройки → Основные → Профиль) и включи полное доверие, Android через установку сертификата CA. Без этого Safari не даст пуши даже после «всё равно перейти».",
+    qr: "QR-подключение",
+    qrHint: "наведи камеру телефона — зайдёт само, без набора 32 символов",
+    qrHowto: "открой камеру (iPhone) или Google Lens (Android), наведи на код и тапни по ссылке. Телефон попадёт сразу в список сессий.",
+    qrCopy: "скопировать ссылку",
+    qrCopied: "ссылка в буфере",
+    qrCopyFailed: "не удалось скопировать",
+    qrSelectManually: "выдели ссылку в поле и скопируй вручную",
+    qrStale: "QR собран для других настроек — обнови",
+    qrRefresh: "обновить QR",
+    qrWarnPlain: "код ведёт по http: без TLS браузер телефона покажет предупреждение, а iOS не даст пуши. Включи TLS выше.",
+    qrFailed: "не удалось собрать QR",
+    upd: "Обновление",
+    updHint: "проверяет GitHub Releases и ставит новую версию",
+    updCheck: "проверить",
+    updNew: "доступна версия",
+    updInstall: "обновить и перезапустить",
+    updUpToDate: "у вас свежая версия",
+    updCurrent: "установлена",
+    updFailed: "обновление не поставилось",
+    updInstalled: "поставлена версия",
+    updCheckFailed: "релизы не ответили",
+    updDownloading: "качаем",
     allowlist: "Белый список IP",
     allowlistHint: "кто из тейлнета достучится. пусто = все. можно CIDR",
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
@@ -218,6 +248,28 @@ const dict: Record<Lang, Record<string, string>> = {
     tlsCaExported: "CA saved to the desktop",
     tlsCaFailed: "could not save the CA",
     tlsCaHint: "dsh-phone-ca.pem lands on the desktop — install it on the phone once: iOS via a downloaded Profile (Settings → General → Profile) plus full trust, Android as a CA certificate. Without it Safari will not grant push even after tapping through the warning.",
+    qr: "QR sign-in",
+    qrHint: "point the phone camera at it — no typing 32 characters",
+    qrHowto: "open the camera (iPhone) or Google Lens (Android), point it at the code and tap the link. The phone lands straight in the session list.",
+    qrCopy: "copy link",
+    qrCopied: "link copied",
+    qrCopyFailed: "copy failed",
+    qrSelectManually: "select the link in the field and copy it manually",
+    qrStale: "this QR was built for other settings — refresh it",
+    qrRefresh: "refresh QR",
+    qrWarnPlain: "the code points at http: without TLS the phone browser shows a warning and iOS will not grant push. Turn on TLS above.",
+    qrFailed: "could not build the QR",
+    upd: "Update",
+    updHint: "checks GitHub Releases and installs the new version",
+    updCheck: "check",
+    updNew: "available",
+    updInstall: "update and restart",
+    updUpToDate: "you are on the latest version",
+    updCurrent: "installed",
+    updFailed: "update failed",
+    updInstalled: "installed version",
+    updCheckFailed: "releases did not respond",
+    updDownloading: "downloading",
     allowlist: "IP allowlist",
     allowlistHint: "who in the tailnet can reach it. empty = everyone. CIDR allowed",
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
@@ -405,6 +457,10 @@ export default function App() {
   const [ntfyTopic, setNtfyTopic] = useState("");
   const [ntfyToken, setNtfyToken] = useState("");
   const [pushBusy, setPushBusy] = useState(false);
+  const [qr, setQr] = useState<QrPayload | null>(null);
+  const [upd, setUpd] = useState<UpdateInfo | null>(null);
+  const [updBusy, setUpdBusy] = useState(false);
+  const [updPct, setUpdPct] = useState<number | null>(null);
   const [toast, setToast] = useState("");
   const [lang, setLang] = useState<Lang>(() =>
     localStorage.getItem("dsh-lang") === "en" ? "en" : "ru"
@@ -479,6 +535,8 @@ export default function App() {
     try {
       const c = await setTlsEnabled(!(cfg?.tls_enabled));
       setCfg(c);
+      // схема поменялась - QR надо пересобрать, иначе он поведёт телефон по http
+      refreshQr();
       fireToast(c.tls_enabled ? t("tlsOn") : t("tlsOff"));
       // узел перезапустился - подтягиваем честный статус (https поднялся или нет)
       await new Promise((r) => setTimeout(r, 1200));
@@ -494,6 +552,80 @@ export default function App() {
       fireToast(t("tlsCaExported"));
     } catch (e) {
       fireToast(t("tlsCaFailed") + ": " + e);
+    }
+  };
+
+  // QR пересобирается при любом изменении адреса, порта или TLS: код обязан
+  // вести туда же, куда смотрит дашборд, иначе телефон уйдёт по http при
+  // включённом TLS и упрётся в предупреждение браузера.
+  const refreshQr = useCallback(() => {
+    connectQr()
+      .then(setQr)
+      .catch(() => setQr(null));
+  }, []);
+
+  const qrUrlRef = useRef<HTMLInputElement | null>(null);
+
+  const onCopyQrUrl = async () => {
+    if (!qr) return;
+    // clipboard API в webview доступен не всегда (зависит от схемы origin),
+    // поэтому держим запасной путь через выделение поля и execCommand
+    try {
+      await navigator.clipboard.writeText(qr.url);
+      fireToast(t("qrCopied"));
+      return;
+    } catch (_) {
+      /* fallthrough */
+    }
+    try {
+      const el = qrUrlRef.current;
+      if (el) {
+        el.focus();
+        el.select();
+        const done = document.execCommand("copy");
+        fireToast(done ? t("qrCopied") : t("qrSelectManually"));
+        return;
+      }
+    } catch (_) {
+      /* fallthrough */
+    }
+    fireToast(t("qrSelectManually"));
+  };
+
+  // Проверка обновлений. Ошибку сети показываем текстом: «обновлений нет» и
+  // «релизы не ответили» — принципиально разные сообщения для пользователя.
+  const refreshUpd = useCallback(() => {
+    updateCheck()
+      .then(setUpd)
+      .catch((e) =>
+        setUpd({ available: false, version: null, current: "", notes: null, error: String(e) })
+      );
+  }, []);
+
+  const onUpdateInstall = async () => {
+    setUpdBusy(true);
+    setUpdPct(0);
+    // прогресс приходит из Rust событием; отписываемся в любом исходе
+    let un: (() => void) | null = null;
+    try {
+      un = await listen<UpdateProgress>("update-progress", (ev) => {
+        setUpdPct(ev.payload?.percent ?? null);
+      });
+    } catch (_) {
+      /* без прогресса установка всё равно работает */
+    }
+    try {
+      const v = await updateInstall();
+      fireToast(t("updInstalled") + " " + v);
+      // узел уже погашен установщиком, перезапускаем приложение
+      await restartApp();
+    } catch (e) {
+      fireToast(t("updFailed") + ": " + e);
+      setUpdBusy(false);
+      setUpdPct(null);
+      refreshUpd();
+    } finally {
+      if (un) un();
     }
   };
 
@@ -606,6 +738,8 @@ export default function App() {
     refreshTailscale();
     getAutostart().then(setAutostartState).catch(() => {});
     refreshPush();
+    refreshQr();
+    refreshUpd();
     const poll = () => serverStatus().then(setStatus).catch(() => {});
     poll();
     const id = window.setInterval(poll, 2000);
@@ -666,6 +800,8 @@ export default function App() {
     try {
       const c = await regenerateToken();
       setCfg(c);
+      // старый токен мёртв - QR с ним больше не работает, пересобираем
+      refreshQr();
       fireToast(t("tRegen"));
     } catch (e) {
       fireToast(t("errPrefix") + e);
@@ -674,7 +810,8 @@ export default function App() {
     }
   };
 
-  const url = cfg ? `http://${cfg.tailscale_ip}:${cfg.listen_port}` : "";
+  const scheme = cfg?.tls_enabled ? "https" : "http";
+  const url = cfg ? `${scheme}://${cfg.tailscale_ip}:${cfg.listen_port}` : "";
   const running = status?.running ?? false;
 
   return (
@@ -1069,6 +1206,132 @@ export default function App() {
                         <div className="text-[11px] text-ember mt-2 break-all">{status.tls_error}</div>
                       )}
                       <div className="text-[11px] text-ash mt-2 leading-relaxed">{t("tlsCaHint")}</div>
+                    </div>
+                  )}
+                </div>
+                <div className="py-2.5 border-t border-edge">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-bone">{t("qr")}</div>
+                      <div className="text-[11.5px] text-ash">{t("qrHint")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshQr}
+                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
+                    >
+                      {t("qrRefresh")}
+                    </button>
+                  </div>
+                  <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                    {qr ? (
+                      <>
+                        <div className="flex gap-4 items-start">
+                          {/* data-URI в <img>, а не innerHTML: браузер не исполняет
+                              скрипты из SVG по ссылке, так что разметка кода не
+                              может стать вектором даже если адрес подменён */}
+                          <img
+                            src={"data:image/svg+xml;utf8," + encodeURIComponent(qr.svg)}
+                            alt={qr.address}
+                            width={188}
+                            height={188}
+                            className="shrink-0 rounded-sm bg-bone p-1.5"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[11.5px] text-bone break-all">{qr.address}</div>
+                            <div className="text-[11px] text-ash mt-2 leading-relaxed">{t("qrHowto")}</div>
+                            {!cfg?.tls_enabled && (
+                              <div className="text-[11px] text-ember mt-2 leading-relaxed">{t("qrWarnPlain")}</div>
+                            )}
+                            {qr.address !== url + "/" && (
+                              <div className="text-[11px] text-ember mt-2">{t("qrStale")}</div>
+                            )}
+                          </div>
+                        </div>
+                        <div className="mt-3 flex items-center gap-2">
+                          <input
+                            ref={qrUrlRef}
+                            readOnly
+                            value={qr.url}
+                            onFocus={(e) => e.currentTarget.select()}
+                            className="flex-1 min-w-0 bg-ink border border-edge rounded-sm px-2.5 py-1.5 text-[11px] text-ash font-mono"
+                            aria-label={t("qrCopy")}
+                          />
+                          <button
+                            type="button"
+                            onClick={onCopyQrUrl}
+                            className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
+                          >
+                            {t("qrCopy")}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-[11.5px] text-ember">{t("qrFailed")}</div>
+                    )}
+                  </div>
+                </div>
+                <div className="py-2.5 border-t border-edge">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-bone">{t("upd")}</div>
+                      <div className="text-[11.5px] text-ash">{t("updHint")}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={refreshUpd}
+                      disabled={updBusy}
+                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition disabled:opacity-40"
+                    >
+                      {t("updCheck")}
+                    </button>
+                  </div>
+                  {upd && (
+                    <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                      {upd.error ? (
+                        <div className="text-[11.5px] text-ember break-all">
+                          {t("updCheckFailed")}: {upd.error}
+                        </div>
+                      ) : upd.available ? (
+                        <>
+                          <div className="text-[11.5px] text-moss">
+                            {t("updNew")} {upd.version} · {t("updCurrent")} {upd.current}
+                          </div>
+                          {upd.notes && (
+                            <div className="text-[11px] text-ash mt-1.5 whitespace-pre-line">
+                              {upd.notes}
+                            </div>
+                          )}
+                          {updBusy && updPct !== null && (
+                            <div className="mt-2">
+                              <div className="h-1 rounded-sm bg-edge overflow-hidden">
+                                <div
+                                  className="h-full bg-moss transition-all"
+                                  style={{ width: `${updPct}%` }}
+                                />
+                              </div>
+                              <div className="text-[11px] text-ash mt-1">
+                                {t("updDownloading")} {updPct}%
+                              </div>
+                            </div>
+                          )}
+                          <button
+                            type="button"
+                            onClick={onUpdateInstall}
+                            disabled={updBusy}
+                            className="mt-2 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition disabled:opacity-40"
+                          >
+                            {updBusy && updPct !== null
+                              ? `${t("updDownloading")} ${updPct}%`
+                              : t("updInstall")}
+                          </button>
+                        </>
+                      ) : (
+                        <div className="text-[11.5px] text-ash">
+                          {t("updUpToDate")}
+                          {upd.current ? ` (${upd.current})` : ""}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

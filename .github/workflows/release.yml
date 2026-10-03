@@ -1,0 +1,100 @@
+name: Release
+
+# Сборка и публикация на таг. Автообновление в приложении читает
+# releases/latest/download/latest.json, поэтому релиз публикуется сразу
+# (releaseDraft: false) - у черновика адрес /latest/ не резолвится.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Таг релиза, например v0.4.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm до setup-node: кэш node-зависимостей требует уже установленный pnpm
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: dsh-phone-desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dsh-phone-desktop/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: dsh-phone-desktop
+        run: pnpm install --frozen-lockfile
+
+      # Тесты гоняем до публикации: релиз с упавшим clippy - это дырявая
+      # версия у пользователей, которых автообновление затянет само.
+      - name: Build frontend dist
+        working-directory: dsh-phone-desktop
+        run: pnpm run build
+
+      - name: PWA tests
+        run: |
+          node dsh-phone/web/test-md.js
+          node dsh-phone/web/test-items.js
+          node dsh-phone/web/test-draft.js
+          node dsh-phone/web/test-qr.js
+
+      - name: Python gateway tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run python tests
+        working-directory: dsh-phone
+        run: python -m unittest
+
+      # --lib недостаточно: контракт автообновления живёт в tests/, и именно он
+      # ловит несовпадение pubkey с ключом подписи до публикации релиза.
+      # Тесты на артефакты в CI скипнутся (бандл собирается позже), конфигурационные - отработают.
+      - name: Rust tests
+        working-directory: dsh-phone-desktop/src-tauri
+        run: cargo test --locked
+
+      - name: Clippy (fail on warnings)
+        working-directory: dsh-phone-desktop/src-tauri
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # tauri-action сам собирает бандл, подписывает апдейтер и кладёт в релиз
+      # latest.json + setup.exe + .sig. Подпись берётся из секретов: приватный
+      # ключ в репозиторий не попадает никогда.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: dsh-phone-desktop
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "DSH Phone __VERSION__"
+          releaseBody: |
+            DSH Phone __VERSION__
+
+            Windows x64: `DSH Phone_<version>_x64-setup.exe` ниже.
+            Приложение с автообновлением подхватит эту версию само.
+          releaseDraft: false
+          prerelease: false

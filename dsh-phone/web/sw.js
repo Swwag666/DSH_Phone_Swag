@@ -1,4 +1,4 @@
-const CACHE = "dsh-phone-v20";
+const CACHE = "dsh-phone-v21";
 const ASSETS = ["/", "/app.js", "/md.js", "/itemrender.js", "/draftsync.js", "/style.css", "/manifest.json", "/icon.svg"];
 
 self.addEventListener("install", (e) => {

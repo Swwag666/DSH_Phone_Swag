@@ -3,6 +3,7 @@ mod config;
 mod gateway;
 mod push;
 mod pwa;
+mod qr;
 mod server;
 mod tailscale;
 mod tls;
@@ -328,6 +329,126 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
     Ok(get_autostart())
 }
 
+/// QR для подключения телефона: URL PWA с токеном в hash-фрагменте.
+/// Токен в QR - это ровно то, зачем фича существует (не набирать 32 символа
+/// руками), поэтому код показывается только в дашборде на самом ПК.
+#[tauri::command]
+fn connect_qr() -> Result<qr::QrPayload, String> {
+    let c = config::AppConfig::load_or_init();
+    qr::payload(&c)
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct UpdateInfo {
+    pub available: bool,
+    /// Версия из релиза (если есть обновление).
+    pub version: Option<String>,
+    /// Текущая версия приложения - всегда заполнена, чтобы дашборд мог
+    /// показать «у вас 0.3.0» даже когда проверка не нашла ничего нового.
+    pub current: String,
+    pub notes: Option<String>,
+    /// Причина, по которой проверить не удалось. Ошибка сети - не повод
+    /// валить команду: дашборд показывает её текстом вместо тихого «обновлений нет».
+    pub error: Option<String>,
+}
+
+/// Проверяет GitHub Releases на новую версию.
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let current = app.package_info().version.to_string();
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("updater не собрался: {e}"))?;
+    match updater.check().await {
+        Ok(Some(u)) => Ok(UpdateInfo {
+            available: true,
+            version: Some(u.version.clone()),
+            current,
+            notes: u.body.clone(),
+            error: None,
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            current,
+            notes: None,
+            error: None,
+        }),
+        Err(e) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            current,
+            notes: None,
+            error: Some(e.to_string()),
+        }),
+    }
+}
+
+/// Качает и ставит обновление, шля прогресс событием `update-progress`.
+///
+/// Узел гасим до установки: NSIS не перезапишет занятый `dsh-phone.exe`
+/// (мы на этом уже горели при локальных сборках - os error 5). После
+/// установки приложение перезапускается, и узел поднимается снова.
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri::Emitter;
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app
+        .updater_builder()
+        .build()
+        .map_err(|e| format!("updater не собрался: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("проверка обновлений: {e}"))?
+        .ok_or_else(|| "нет доступного обновления".to_string())?;
+    let version = update.version.clone();
+
+    {
+        let state = app.state::<ServerState>();
+        stop_inner(&state);
+    }
+
+    let h = app.clone();
+    let mut downloaded: u64 = 0;
+    let mut total: Option<u64> = None;
+    update
+        .download_and_install(
+            move |chunk, len| {
+                downloaded += chunk as u64;
+                if let Some(t) = len {
+                    total = Some(t);
+                }
+                let percent = total
+                    .filter(|t| *t > 0)
+                    .map(|t| ((downloaded * 100) / t).min(100));
+                let _ = h.emit(
+                    "update-progress",
+                    serde_json::json!({
+                        "downloaded": downloaded,
+                        "total": total,
+                        "percent": percent,
+                    }),
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("установка обновления: {e}"))?;
+
+    Ok(version)
+}
+
+/// Перезапуск после установки. request_restart, а не restart: первый идёт
+/// через RunEvent::Exit и потому срабатывает надёжно из любого потока.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.request_restart();
+}
+
 #[tauri::command]
 fn set_start_hidden(enabled: bool) -> config::AppConfig {
     let mut c = config::AppConfig::load_or_init();
@@ -489,6 +610,10 @@ pub fn run() {
             set_allowed_ips,
             set_tls_enabled,
             tls_export_ca,
+            connect_qr,
+            update_check,
+            update_install,
+            restart_app,
             set_ntfy,
             push_status,
             push_test,
@@ -499,6 +624,8 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main(app);
         }))
+        // автообновление из GitHub Releases (рестарт делает ядро: request_restart)
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Закрыть", true, None::<&str>)?;

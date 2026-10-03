@@ -31,6 +31,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -47,6 +48,18 @@
         "languages": ["English", "Russian"],
         "displayLanguageSelector": true,
         "installerIcon": "icons/icon.ico"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/Swwag666/DSH_Phone_Swag/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg4RjEzNjQzMUJGQ0Y3NTYKUldSVzkvd2JRemJ4aUM1bFlWYkEyV1d6eU8wMkJWNjlDN1dweUxZMEt5MTY1SURBazJhZDJ2OWQK",
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

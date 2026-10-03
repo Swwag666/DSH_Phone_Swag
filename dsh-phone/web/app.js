@@ -1712,7 +1712,28 @@ function refreshSessions() {
 }
 
 // ---------- boot ----------
+// QR-подключение кладёт токен в hash-фрагмент (#t=...). Фрагмент не уходит на
+// сервер и не попадает в историю запросов, поэтому читаем его один раз при
+// загрузке и сразу вычищаем из адресной строки - чтобы секрет не остался
+// висеть в omnibox и не улетел при шаринге ссылки.
+function takeTokenFromHash() {
+  let h = "";
+  try { h = window.location.hash || ""; } catch (_) { return ""; }
+  const m = h.match(/(?:^|[#&])t=([A-Za-z0-9]+)/);
+  if (!m) return "";
+  const t = m[1];
+  try {
+    // history.replaceState чистит hash без перезагрузки страницы
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  } catch (_) {}
+  return t;
+}
+
 async function boot() {
+  // QR-токен из hash приоритетнее сохранённого: так повторное сканирование
+  // перевязывает устройство даже если старый токен уже не подходит
+  const hashToken = takeTokenFromHash();
+  if (hashToken) token = hashToken;
   // sw.js is network-first: it never serves a stale app shell, only acts as
   // an offline fallback - so we keep it registered instead of tearing it down.
   if ("serviceWorker" in navigator) {
@@ -1726,6 +1747,10 @@ async function boot() {
   if (token) {
     const ok = await tryAuth(token);
     if (ok) return;
+    // вход не прошёл (мост ещё поднимается или токен сменился) - оставляем его
+    // в поле, чтобы можно было нажать «подключить» ещё раз, а не набирать
+    // 32 символа руками: в этом и весь смысл QR
+    if (hashToken) { try { $("token-input").value = hashToken; } catch (_) {} }
   }
   show("view-auth");
 }
