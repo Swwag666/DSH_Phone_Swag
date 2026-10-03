@@ -4,6 +4,7 @@
 pub const INDEX_HTML: &str = include_str!("../../../dsh-phone/web/index.html");
 pub const MD_JS: &str = include_str!("../../../dsh-phone/web/md.js");
 pub const ITEMRENDER_JS: &str = include_str!("../../../dsh-phone/web/itemrender.js");
+pub const DRAFTSYNC_JS: &str = include_str!("../../../dsh-phone/web/draftsync.js");
 pub const APP_JS: &str = include_str!("../../../dsh-phone/web/app.js");
 pub const STYLE_CSS: &str = include_str!("../../../dsh-phone/web/style.css");
 pub const MANIFEST: &str = include_str!("../../../dsh-phone/web/manifest.json");
@@ -16,6 +17,7 @@ pub fn lookup(path: &str) -> Option<(&'static str, &'static str)> {
         "" | "index.html" => Some((INDEX_HTML, "text/html; charset=utf-8")),
         "md.js" => Some((MD_JS, "text/javascript; charset=utf-8")),
         "itemrender.js" => Some((ITEMRENDER_JS, "text/javascript; charset=utf-8")),
+        "draftsync.js" => Some((DRAFTSYNC_JS, "text/javascript; charset=utf-8")),
         "app.js" => Some((APP_JS, "text/javascript; charset=utf-8")),
         "style.css" => Some((STYLE_CSS, "text/css; charset=utf-8")),
         "manifest.json" => Some((MANIFEST, "application/manifest+json")),

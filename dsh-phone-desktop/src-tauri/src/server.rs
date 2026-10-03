@@ -532,6 +532,46 @@ mod tests {
     }
 
     #[test]
+    fn pwa_serves_every_script_index_html_references() {
+        // every <script src> and <link href> in index.html must resolve in the
+        // embedded asset table - a miss means a 404 on a fresh page
+        let html = crate::pwa::INDEX_HTML;
+        let mut refs: Vec<String> = Vec::new();
+        let mut rest = html;
+        while let Some(pos) = rest.find("src=\"/") {
+            rest = &rest[pos + 6..];
+            let end = rest.find('"').unwrap_or(0);
+            if end > 0 {
+                refs.push(rest[..end].to_string());
+            }
+        }
+        let mut rest = html;
+        while let Some(pos) = rest.find("href=\"/") {
+            rest = &rest[pos + 7..];
+            let end = rest.find('"').unwrap_or(0);
+            if end > 0 {
+                refs.push(rest[..end].to_string());
+            }
+        }
+        assert!(!refs.is_empty(), "no asset refs found in index.html");
+        for r in refs {
+            let path = r.split('?').next().unwrap_or("");
+            assert!(
+                crate::pwa::lookup(path).is_some(),
+                "index.html references {} but pwa.rs does not embed it",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn pwa_draftsync_is_served() {
+        let (body, ctype) = crate::pwa::lookup("draftsync.js").expect("draftsync.js must be embedded");
+        assert!(body.contains("draftSyncDecision"));
+        assert!(ctype.starts_with("text/javascript"));
+    }
+
+    #[test]
     fn whitelist_has_no_duplicates() {
         let mut sorted = WHITELIST.to_vec();
         sorted.sort_unstable();
