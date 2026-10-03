@@ -21,6 +21,61 @@ let turnHadError = false;
 let turnT0 = 0;
 let readUpTo = (() => { try { return JSON.parse(localStorage.getItem("dsh-phone-read") || "{}"); } catch (_) { return {}; } })();
 
+// ---------- draft sync (поле ввода живёт на всех устройствах) ----------
+const deviceId = (() => {
+  let id = "";
+  try { id = localStorage.getItem("dsh-phone-devid") || ""; } catch (_) {}
+  if (!id) {
+    id = "d" + Math.random().toString(36).slice(2, 10);
+    try { localStorage.setItem("dsh-phone-devid", id); } catch (_) {}
+  }
+  return id;
+})();
+let lastTypedAt = 0;
+let draftTimer = null;
+let draftPillTimer = null;
+
+function scheduleDraftOut() {
+  if (draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    draftTimer = null;
+    if (!activeSession) return;
+    api("session.updateDraft", { sessionId: activeSession, text: $("input").value, deviceId: deviceId })
+      .catch(() => {});
+  }, DRAFT_PUSH_DELAY_MS);
+}
+
+function applyRemoteDraft(remote) {
+  if (!remote || remote.sessionId !== activeSession) return;
+  const text = draftSyncDecision(remote, deviceId, lastTypedAt, Date.now());
+  if (text === null) return;
+  if (!draftChanged($("input").value, text)) return;
+  $("input").value = text;
+  autoGrow();
+  if (text) showDraftPill();
+}
+
+function showDraftPill() {
+  const pill = $("draft-pill");
+  if (!pill) return;
+  pill.classList.add("on");
+  if (draftPillTimer) clearTimeout(draftPillTimer);
+  draftPillTimer = setTimeout(() => { pill.classList.remove("on"); draftPillTimer = null; }, 2500);
+}
+
+function loadRemoteDraft() {
+  if (!activeSession) return;
+  api("session.getDraft", { sessionId: activeSession }).then((r) => {
+    if (!r.ok || !r.result) return;
+    if (r.result.origin === deviceId) return;
+    const text = typeof r.result.text === "string" ? r.result.text : "";
+    if (text && !$("input").value) {
+      $("input").value = text;
+      autoGrow();
+    }
+  }).catch(() => {});
+}
+
 function orderTs(s) {
   return s && s.orderingTime ? new Date(s.orderingTime).getTime() : 0;
 }
@@ -227,6 +282,9 @@ function openChat(s) {
   nodeFor = new Map();
   noticeSig = "";
   $("approval").innerHTML = "";
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
+  $("input").value = "";
+  autoGrow();
   $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат") + " — загрузка…";
   show("view-chat");
   watch(activeSession, false);
@@ -243,6 +301,7 @@ function openChat(s) {
     lastError = "";
     $("chat-meta").textContent = cleanText(s.title || s.cwd || "чат");
     refreshActiveChat();
+    loadRemoteDraft();
   }).catch((e) => {
     lastError = "ошибка загрузки истории: " + e.message;
     status(lastError);
@@ -643,6 +702,10 @@ function autoGrow() {
   el.style.height = Math.min(el.scrollHeight, 160) + "px";
 }
 $("input").addEventListener("input", autoGrow);
+$("input").addEventListener("input", () => {
+  lastTypedAt = Date.now();
+  scheduleDraftOut();
+});
 
 $("composer").onsubmit = (e) => {
   e.preventDefault();
@@ -659,6 +722,7 @@ $("composer").onsubmit = (e) => {
   renderChips();
   const params = { sessionId: activeSession, content: val, attachments: atts };
   status("отправка…");
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
   api("session.startTurn", params).then((r) => {
     if (r.ok) {
       const queued = r.result && r.result.queued;
@@ -670,6 +734,7 @@ $("composer").onsubmit = (e) => {
       pendingAttachments = atts;
       renderChips();
       autoGrow();
+      scheduleDraftOut();
       status("не ушло: " + (r.error || "?") + " - вернула в поле");
     }
   });
@@ -1425,6 +1490,7 @@ function processEvent(ev) {
   if (ev.type === "bridge") { bridgeOn = ev.data.status === "connected"; $("status-dot").className = "dot " + (bridgeOn ? "on" : "off"); }
   else if (ev.type === "sessions") { sessions = ev.data.sessions || []; renderSessions(); }
   else if (ev.type === "state" && ev.data.sessionId === activeSession) { applyState(ev.data.state); }
+  else if (ev.type === "draft") { applyRemoteDraft(ev.data); }
   else if (ev.type === "items" && ev.data.sessionId === activeSession) {
     mergeInto(ev.data.items, true);
     for (const it of ev.data.items || []) { if (isErrorItem(it) || isTurnError(it)) turnHadError = true; }

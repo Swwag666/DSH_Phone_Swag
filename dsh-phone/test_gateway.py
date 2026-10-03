@@ -459,5 +459,113 @@ class TestServerIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"404 Not Found", resp.split(b"\r\n")[0])
 
 
+class TestDraftSync(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.gw = make_gateway()
+        self.server = await asyncio.start_server(
+            lambda r, w: gw.handle_http(r, w, self.gw), "127.0.0.1", 0
+        )
+        self.port = self.server.sockets[0].getsockname()[1]
+        self.addr = ("127.0.0.1", self.port)
+        self.tok = self.gw.cfg["gatewayToken"]
+
+    async def asyncTearDown(self):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def rpc(self, method, params, token=None):
+        body = json.dumps({"token": token or self.tok, "method": method, "params": params}).encode()
+        raw = b"POST /api/rpc HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+        reader, writer = await asyncio.open_connection(*self.addr)
+        writer.write(raw)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+        head, _, rest = data.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":")[1].strip())
+        while len(rest) < length:
+            rest += await asyncio.wait_for(reader.readexactly(length - len(rest)), 10)
+        writer.close()
+        return head, json.loads(rest)
+
+    def draft_events(self):
+        return [e for e in self.gw.events if e["type"] == "draft"]
+
+    async def test_update_then_get_roundtrip(self):
+        head, body = await self.rpc("session.updateDraft", {
+            "sessionId": "s1", "text": "привет из поля", "deviceId": "dev-1",
+        })
+        self.assertIn(b"200 OK", head.split(b"\r\n")[0])
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["result"]["saved"])
+
+        head, body = await self.rpc("session.getDraft", {"sessionId": "s1"})
+        self.assertIn(b"200 OK", head.split(b"\r\n")[0])
+        self.assertEqual(body["result"]["text"], "привет из поля")
+        self.assertEqual(body["result"]["origin"], "dev-1")
+        self.assertGreater(body["result"]["ts"], 0)
+
+    async def test_get_unknown_session_is_empty(self):
+        head, body = await self.rpc("session.getDraft", {"sessionId": "nope"})
+        self.assertIn(b"200 OK", head.split(b"\r\n")[0])
+        self.assertEqual(body["result"]["text"], "")
+
+    async def test_update_without_session_400(self):
+        head, body = await self.rpc("session.updateDraft", {"text": "x"})
+        self.assertIn(b"400 Bad Request", head.split(b"\r\n")[0])
+        self.assertFalse(body["ok"])
+
+    async def test_update_wrong_token_401(self):
+        head, body = await self.rpc("session.updateDraft",
+                                    {"sessionId": "s1", "text": "x"}, token="wrong-token-000000")
+        self.assertIn(b"401 Unauthorized", head.split(b"\r\n")[0])
+
+    async def test_update_pushes_draft_event(self):
+        await self.rpc("session.updateDraft", {
+            "sessionId": "s1", "text": "текст", "deviceId": "dev-9",
+        })
+        evs = self.draft_events()
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["data"]["sessionId"], "s1")
+        self.assertEqual(evs[0]["data"]["text"], "текст")
+        self.assertEqual(evs[0]["data"]["origin"], "dev-9")
+
+    async def test_non_string_text_becomes_empty(self):
+        await self.rpc("session.updateDraft", {"sessionId": "s2", "text": None})
+        head, body = await self.rpc("session.getDraft", {"sessionId": "s2"})
+        self.assertEqual(body["result"]["text"], "")
+
+    async def test_text_capped_at_10000(self):
+        await self.rpc("session.updateDraft", {"sessionId": "s3", "text": "x" * 20000})
+        head, body = await self.rpc("session.getDraft", {"sessionId": "s3"})
+        self.assertEqual(len(body["result"]["text"]), 10000)
+
+    async def test_drafts_map_stays_bounded(self):
+        for i in range(80):
+            await self.rpc("session.updateDraft", {"sessionId": "s%d" % i, "text": "t"})
+        self.assertLessEqual(len(self.gw.drafts), 64)
+
+    async def test_startturn_failure_keeps_draft(self):
+        # bridge is down -> startTurn fails -> the draft must survive
+        await self.rpc("session.updateDraft", {"sessionId": "s1", "text": "черновик"})
+        head, _ = await self.rpc("session.startTurn", {"sessionId": "s1", "content": "го"})
+        self.assertIn(b"502 Bad Gateway", head.split(b"\r\n")[0])
+        head, body = await self.rpc("session.getDraft", {"sessionId": "s1"})
+        self.assertEqual(body["result"]["text"], "черновик")
+
+    async def test_clear_draft_unit(self):
+        g = make_gateway()
+        g.set_draft("s1", "abc", "dev")
+        self.assertEqual(g.get_draft("s1")["text"], "abc")
+        g.clear_draft("s1")
+        self.assertEqual(g.get_draft("s1")["text"], "")
+        # clearing absent draft: no crash, no duplicate events
+        g.clear_draft("s1")
+        clears = [e for e in g.events if e["type"] == "draft" and e["data"]["text"] == ""]
+        self.assertEqual(len(clears), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

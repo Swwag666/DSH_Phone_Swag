@@ -314,6 +314,13 @@ button { cursor: pointer; font-family: inherit; }
 #mic.rec { color: #ff5c72; border-color: rgba(230,53,79,.5); background: rgba(230,53,79,.1); filter: drop-shadow(0 0 8px rgba(230,53,79,.5)); animation: micpulse 1.2s ease-in-out infinite; }
 @keyframes micpulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 #attach-chips { display: flex; flex-wrap: wrap; gap: 7px; padding: 8px 10px 0; border-top: 1px solid var(--line); background: rgba(10,8,14,.6); }
+#draft-pill {
+  margin: 6px 10px 0; font-size: 11px; letter-spacing: .06em; color: #9c8f88;
+  border: 1px solid #2c2738; border-radius: 12px; padding: 3px 10px; width: fit-content;
+  background: rgba(20,17,28,.85); opacity: 0; transform: translateY(4px);
+  transition: opacity .25s, transform .25s; pointer-events: none;
+}
+#draft-pill.on { opacity: 1; transform: translateY(0); }
 #msgactions { display: flex; gap: 8px; padding: 7px 10px 0; background: rgba(10,8,14,.6); }
 #msgactions button {
   background: rgba(20,17,28,.9); border: 1px solid #2c2738; color: #a39a92;

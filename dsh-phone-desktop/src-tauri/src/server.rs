@@ -31,6 +31,8 @@ const WHITELIST: &[&str] = &[
     "session.interrupt",
     "session.updateSelections",
     "session.respondInteraction",
+    "session.updateDraft",
+    "session.getDraft",
     "catalog.listModels",
     "catalog.listPermissions",
     "catalog.listAgentPresets",
@@ -110,6 +112,36 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
     } else {
         json!({})
     };
+    // Drafts are gateway-local state, never forwarded to the bridge.
+    if b.method == "session.updateDraft" || b.method == "session.getDraft" {
+        let sid = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if sid.is_empty() {
+            return json_status(
+                StatusCode::BAD_REQUEST,
+                json!({ "ok": false, "error": "no sessionId" }),
+            );
+        }
+        if b.method == "session.getDraft" {
+            return json_status(StatusCode::OK, json!({ "ok": true, "result": hub.get_draft(&sid) }));
+        }
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let origin = params
+            .get("deviceId")
+            .or_else(|| params.get("origin"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        hub.set_draft(&sid, &text, &origin);
+        return json_status(StatusCode::OK, json!({ "ok": true, "result": { "saved": true } }));
+    }
     if b.method == "session.startTurn" {
         if let Some(obj) = params.as_object_mut() {
             if !obj.contains_key("clientMessageId") {
@@ -150,12 +182,27 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
             }
         }
     }
+    let turn_sid = if b.method == "session.startTurn" {
+        params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        String::new()
+    };
     match hub
         .bridge
         .request(&b.method, params, Duration::from_secs(120))
         .await
     {
-        Ok(result) => json_status(StatusCode::OK, json!({ "ok": true, "result": result })),
+        Ok(result) => {
+            // the message consumed the draft - wipe it everywhere
+            if !turn_sid.is_empty() {
+                hub.clear_draft(&turn_sid);
+            }
+            json_status(StatusCode::OK, json!({ "ok": true, "result": result }))
+        }
         Err(e) => json_status(StatusCode::BAD_GATEWAY, json!({ "ok": false, "error": e })),
     }
 }
@@ -479,8 +526,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whitelist_is_16_methods() {
-        assert_eq!(WHITELIST.len(), 16);
+    fn whitelist_is_18_methods() {
+        assert_eq!(WHITELIST.len(), 18);
         // the README/agent docs must match this count
     }
 
