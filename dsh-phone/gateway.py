@@ -28,6 +28,7 @@ import ipaddress
 import json
 import os
 import secrets
+import ssl
 import time
 import uuid
 from urllib.parse import urlparse, parse_qs
@@ -56,6 +57,8 @@ DEFAULT_CONFIG = {
     "ntfyUrl": "",
     "ntfyTopic": "",
     "ntfyToken": "",
+    # TLS: цепочка та же, что минтит Rust-узел (%APPDATA%/dsh-phone/tls_cert.pem)
+    "tlsEnabled": False,
 }
 
 # Request guard rails: header count/size and body size caps so a single
@@ -1008,12 +1011,41 @@ async def main():
     if not cfg.get("ntfyTopic"):
         cfg["ntfyTopic"] = "dsh-" + secrets.token_hex(8)
         json.dump(cfg, open(CONFIG_PATH, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    # Web Push in the phone browser needs a secure context, so TLS matters here
+    # too. The Python gateway reuses the very chain the Rust node mints
+    # (%APPDATA%/dsh-phone/tls_cert.pem + tls_key.pem) - one CA to install on
+    # the phone for either backend. Without those files we say so loudly
+    # instead of silently serving http while the dashboard claims TLS is on.
+    ssl_ctx = None
+    scheme = "http"
+    if cfg.get("tlsEnabled"):
+        appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+        cert = os.path.join(appdata, "dsh-phone", "tls_cert.pem")
+        key = os.path.join(appdata, "dsh-phone", "tls_key.pem")
+        if os.path.exists(cert) and os.path.exists(key):
+            try:
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ssl_ctx.load_cert_chain(cert, key)
+                scheme = "https"
+            except Exception as e:  # noqa: BLE001
+                print(f"ERROR: TLS requested but the cert failed to load: {e}")
+                print("       Serving plain HTTP - push will NOT work in the phone browser.")
+        else:
+            print("WARNING: tlsEnabled is on but no cert found at")
+            print(f"         {cert}")
+            print("         Run the Rust node once with TLS on to mint the chain,")
+            print("         or turn tlsEnabled off. Serving plain HTTP.")
+
     server = await asyncio.start_server(
-        lambda r, w: handle_http(r, w, gw), cfg["listenHost"], cfg["listenPort"]
+        lambda r, w: handle_http(r, w, gw),
+        cfg["listenHost"],
+        cfg["listenPort"],
+        ssl=ssl_ctx,
     )
-    print(f"dsh-phone gateway listening on {cfg['listenHost']}:{cfg['listenPort']}")
+    print(f"dsh-phone gateway listening on {scheme}://{cfg['listenHost']}:{cfg['listenPort']}")
     print(f"gateway token: {cfg['gatewayToken']}")
-    print(f"open in phone browser (over Tailscale): http://<pc-tailscale-ip>:{cfg['listenPort']}/")
+    print(f"open in phone browser (over Tailscale): {scheme}://<pc-tailscale-ip>:{cfg['listenPort']}/")
 
     tasks = [
         asyncio.create_task(gw.bridge_loop()),

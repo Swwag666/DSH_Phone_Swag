@@ -71,6 +71,20 @@ fn set_tls_runtime(v: Option<String>) {
     }
 }
 
+/// Почему TLS не поднялся (None = поднялся или не включён). Дашборд показывает
+/// это юзеру: без него «включил TLS - не работает» выглядит как мистика.
+pub fn tls_runtime_error() -> Option<String> {
+    TLS_RUNTIME.lock().ok().and_then(|g| g.clone())
+}
+
+/// Сброс перед рестартом листенера: ошибка прошлой попытки не должна висеть над
+/// новой, иначе дашборд пугает юзера уже починенной проблемой.
+pub fn clear_tls_runtime() {
+    if let Ok(mut g) = TLS_RUNTIME.lock() {
+        *g = None;
+    }
+}
+
 async fn health(State(gw): State<Arc<Gateway>>) -> Response {
     let ping = gw.main_hub().plugin_ping_snapshot();
     let mut obj = json!({
@@ -746,6 +760,15 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
             Ok(config) => {
                 let sha = crate::tls::cert_sha256().unwrap_or_default();
                 eprintln!("dsh-phone: TLS on :{port} sha256={sha}");
+
+                // The DSH Desktop composer plugin talks to the node over plain
+                // http://127.0.0.1:<port>. Once TLS owns that port the plugin
+                // would lose its bootstrap silently, so it gets a second,
+                // loopback-only HTTP listener on port+1 (API routes only - the
+                // PWA keeps going through https).
+                let loop_port = port.saturating_add(1);
+                spawn_loopback_http(gw.clone(), loop_port);
+
                 let handle = axum_server::Handle::new();
                 let h2 = handle.clone();
                 tokio::spawn(async move {
@@ -776,6 +799,59 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         set_tls_runtime(None);
         serve_http(app, addr, rx).await;
     }
+}
+
+/// API-only HTTP listener bound to 127.0.0.1, used by the in-profile composer
+/// plugin while TLS owns the main port. Peers are checked twice (bind address +
+/// per-request ConnectInfo), and no static files are served here.
+///
+/// Why plain HTTP is acceptable here: TLS exists to protect the phone over the
+/// tailnet, while this listener never leaves the machine. Everything except
+/// /api/draft-config still requires the token, and draft-config was already
+/// loopback + allowed-origin gated on the main port. A local process able to
+/// call loopback endpoints could do the same before TLS was turned on, so the
+/// local threat model is unchanged - the tailnet one is now encrypted.
+fn spawn_loopback_http(gw: Arc<Gateway>, port: u16) {
+    let app = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/draft-config", get(draft_config))
+        .route("/api/rpc", post(rpc))
+        .route("/api/events", get(events))
+        .route("/api/watch", post(watch))
+        .layer(middleware::from_fn_with_state(gw.clone(), count_reqs))
+        .layer(middleware::from_fn(loopback_only))
+        .layer(middleware::from_fn(cors_layer))
+        .with_state(gw);
+
+    tokio::spawn(async move {
+        let addr = SocketAddr::from((std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port));
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                eprintln!("dsh-phone: loopback http (plugin) on 127.0.0.1:{port}");
+                let _ = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await;
+            }
+            Err(e) => eprintln!("dsh-phone: loopback http bind {addr}: {e}"),
+        }
+    });
+}
+
+/// Hard gate: anything that is not loopback is refused before the handler runs.
+async fn loopback_only(
+    ConnectInfo(ci): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !ci.ip().is_loopback() {
+        return json_status(
+            StatusCode::FORBIDDEN,
+            json!({ "ok": false, "error": "loopback_only" }),
+        );
+    }
+    next.run(req).await
 }
 
 async fn serve_http(

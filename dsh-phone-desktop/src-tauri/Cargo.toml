@@ -26,7 +26,8 @@ get_if_addrs = "0.5"
 base64 = "0.22"
 sha2 = "0.10"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-rcgen = "0.13"
+# x509-parser: чтобы перечитывать свой же CA из PEM и подписывать им лист
+rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls-pemfile = "2"
 # Explicit dependency so we can install a CryptoProvider ourselves. Feature
 # unification leaves both `aws-lc-rs` (axum-server) and `ring` (reqwest/rcgen)

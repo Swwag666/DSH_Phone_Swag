@@ -109,6 +109,183 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+/// Timestamped copy of a config we could not parse. A single `.bak` slot was
+/// overwritten by the next failure, which once destroyed the only backup of a
+/// working token - the phone then could not authenticate at all.
+fn backup_config(cp: &std::path::Path) {
+    let stamp = chrono_stamp();
+    let target = cp.with_file_name(format!("config-corrupt-{stamp}.json"));
+    let _ = fs::copy(cp, &target);
+    // и обычный .bak на всякий случай, для тех кто ищет привычное имя
+    let _ = fs::copy(cp, cp.with_extension("json.bak"));
+    // держим не больше 10 копий
+    if let Some(dir) = cp.parent() {
+        if let Ok(entries) = fs::read_dir(dir) {
+            let mut corrupt: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with("config-corrupt-"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            corrupt.sort();
+            while corrupt.len() > 10 {
+                let oldest = corrupt.remove(0);
+                let _ = fs::remove_file(&oldest);
+            }
+        }
+    }
+}
+
+fn chrono_stamp() -> String {
+    let s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{s}")
+}
+
+/// A corrupt config must not cost the user their token, VAPID keys or ntfy
+/// topic. Two passes:
+///  1. the JSON still parses but one field changed type -> read field by field;
+///  2. the JSON is truncated/garbage (torn write, disk full) -> scrape the
+///     secrets out of the raw text, which is where most real corruption lands.
+fn salvage(raw: &str) -> Option<AppConfig> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(obj) = v.as_object() {
+            if let Some(c) = salvage_fields(obj) {
+                return Some(c);
+            }
+        }
+    }
+    salvage_text(raw)
+}
+
+/// Last-resort scrape from raw text. Only pulls the values that cost the user
+/// real pain to lose: the token (phone auth), the ntfy topic (secret channel)
+/// and the VAPID key pair (push identity). Everything else regenerates safely.
+fn salvage_text(raw: &str) -> Option<AppConfig> {
+    fn grab_str(raw: &str, key: &str) -> Option<String> {
+        // допускаем пробелы вокруг ':' и обрезанный хвост файла
+        let pat = format!("\"{key}\"");
+        let at = raw.find(&pat)?;
+        let rest = &raw[at + pat.len()..];
+        let colon = rest.find(':')?;
+        let after = rest[colon + 1..].trim_start();
+        if !after.starts_with('"') {
+            return None;
+        }
+        let body = &after[1..];
+        let end = body.find('"')?;
+        let v = body[..end].to_string();
+        if v.is_empty() {
+            return None;
+        }
+        Some(v)
+    }
+
+    let mut c = AppConfig::generate();
+    let mut kept_any = false;
+    if let Some(t) = grab_str(raw, "token") {
+        if t.len() >= 16 {
+            c.token = t;
+            kept_any = true;
+        }
+    }
+    if let Some(topic) = grab_str(raw, "ntfy_topic") {
+        if topic.starts_with("dsh-") {
+            c.ntfy_topic = Some(topic);
+            kept_any = true;
+        }
+    }
+    if let Some(pub_hex) = grab_str(raw, "public_hex") {
+        if let Some(private_hex) = grab_str(raw, "private_hex") {
+            if pub_hex.len() >= 64 && private_hex.len() >= 32 {
+                c.vapid_keys = Some(crate::push::VapidKeys {
+                    public_hex: pub_hex,
+                    private_hex,
+                });
+                kept_any = true;
+            }
+        }
+    }
+    if !kept_any {
+        return None;
+    }
+    eprintln!("dsh-phone: config unparsable - scraped secrets out of the raw text");
+    Some(c)
+}
+
+fn salvage_fields(obj: &serde_json::Map<String, serde_json::Value>) -> Option<AppConfig> {
+    let mut c = AppConfig::generate();
+    let mut kept_any = false;
+    if let Some(t) = obj.get("token").and_then(|x| x.as_str()) {
+        if t.len() >= 16 {
+            c.token = t.to_string();
+            kept_any = true;
+        }
+    }
+    if let Some(p) = obj.get("listen_port").and_then(|x| x.as_u64()) {
+        c.listen_port = p as u16;
+    }
+    if let Some(h) = obj.get("listen_host").and_then(|x| x.as_str()) {
+        c.listen_host = h.to_string();
+    }
+    if let Some(id) = obj.get("connector_id").and_then(|x| x.as_str()) {
+        c.connector_id = id.to_string();
+    }
+    if let Some(st) = obj.get("staging_path").and_then(|x| x.as_str()) {
+        c.staging_path = st.to_string();
+    }
+    if let Some(tls) = obj.get("tls_enabled").and_then(|x| x.as_bool()) {
+        c.tls_enabled = tls;
+    }
+    if let Some(devs) = obj.get("devices") {
+        if let Ok(d) = serde_json::from_value::<Vec<DeviceEntry>>(devs.clone()) {
+            if !d.is_empty() {
+                kept_any = true;
+            }
+            c.devices = d;
+        }
+    }
+    if let Some(vk) = obj.get("vapid_keys") {
+        if let Ok(k) = serde_json::from_value::<crate::push::VapidKeys>(vk.clone()) {
+            c.vapid_keys = Some(k);
+            kept_any = true;
+        }
+    }
+    if let Some(subs) = obj.get("push_subscriptions") {
+        if let Ok(s) = serde_json::from_value::<Vec<crate::push::PushSubscription>>(subs.clone()) {
+            if !s.is_empty() {
+                kept_any = true;
+            }
+            c.push_subscriptions = s;
+        }
+    }
+    for (key, out) in [
+        ("ntfy_url", &mut c.ntfy_url),
+        ("ntfy_topic", &mut c.ntfy_topic),
+        ("ntfy_token", &mut c.ntfy_token),
+    ] {
+        if let Some(s) = obj.get(key).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                *out = Some(s.to_string());
+                kept_any = true;
+            }
+        }
+    }
+    if let Some(n) = obj.get("ntfy_enabled").and_then(|x| x.as_bool()) {
+        c.ntfy_enabled = n;
+    }
+    if !kept_any {
+        return None;
+    }
+    eprintln!("dsh-phone: salvaged config (token kept: {})", c.token.len() >= 16);
+    Some(c)
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -214,9 +391,25 @@ impl AppConfig {
                         return c;
                     }
                     Err(e) => {
-                        // не теряем файл молча: сохраняем копию, чтобы ключ можно было вернуть руками
-                        eprintln!("dsh-phone: config parse failed ({e}); backed up");
-                        let _ = fs::copy(&cp, cp.with_extension("json.bak"));
+                        // не теряем файл молча: копия с меткой времени (простая
+                        // .bak затиралась при следующем сбое и уносила последний
+                        // живой токен), плюс пробуем вытащить ценности из битого
+                        // JSON - один повреждённый хвост не должен стоить юзеру
+                        // токена, VAPID-ключей и ntfy-топика.
+                        eprintln!("dsh-phone: config parse failed ({e}); backing up and salvaging");
+                        backup_config(&cp);
+                        if let Some(mut c) = salvage(&s) {
+                            c.config_path = cp.to_string_lossy().to_string();
+                            c.tailscale_ip = tailscale_ip();
+                            if c.vapid_keys.is_none() {
+                                c.vapid_keys = Some(crate::push::VapidKeys::generate());
+                            }
+                            if c.ntfy_topic.is_none() {
+                                c.ntfy_topic = Some(random_topic());
+                            }
+                            let _ = c.save();
+                            return c;
+                        }
                     }
                 }
             }
@@ -232,7 +425,13 @@ impl AppConfig {
             let _ = fs::create_dir_all(parent);
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(p, json).map_err(|e| e.to_string())
+        // атомарно: пишем во временный и переименовываем. Обычный fs::write
+        // рвал конфиг пополам при падении/выключении в момент записи, а битый
+        // конфиг дальше регенерил токен и телефон терял доступ.
+        let tmp = p.with_extension("json.tmp");
+        fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        // rename атомарен и на Windows заменяет существующий файл
+        fs::rename(&tmp, p).map_err(|e| e.to_string())
     }
 
     /// True when a connection from this peer IP should be accepted.
@@ -285,8 +484,14 @@ mod tests {
         IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
     }
 
+    /// Тесты ниже крутят DSH_PHONE_CONFIG_DIR - процесс-глобальную переменную.
+    /// Без замка они читают конфиг из каталога соседа и падают случайно, поэтому
+    /// все, кто её трогает, держат этот мьютекс.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn gen_writes_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dsh-phone-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("DSH_PHONE_CONFIG_DIR", &dir);
@@ -391,5 +596,160 @@ mod tests {
             .allow_ip(IpAddr::V6("fd7a:115c:a1e0::2".parse::<Ipv6Addr>().unwrap())));
         assert!(!c
             .allow_ip(IpAddr::V6("fd7a::1".parse::<Ipv6Addr>().unwrap())));
+    }
+    // ---- регрессия: битый конфиг однажды стоил юзеру токена и VAPID-ключей ----
+    // Значения в фикстурах собираются кодом (а не вписаны готовыми строками),
+    // чтобы тест не зависел от того, как файл прошёл через редактор/маскиратор.
+
+    /// Токен вида "aaaa..." - заведомо не секрет, но по формату совпадает с
+    /// тем, что кладёт new_token() (32 символа).
+    fn fake_token(seed: char) -> String {
+        std::iter::repeat(seed).take(32).collect()
+    }
+
+    fn fake_hex(seed: &str, len: usize) -> String {
+        let mut s = String::new();
+        while s.len() < len {
+            s.push_str(seed);
+        }
+        s.truncate(len);
+        s
+    }
+
+    #[test]
+    fn salvage_keeps_secrets_from_truncated_json() {
+        // оборванная запись: файл не парсится как JSON вовсе
+        let tok = fake_token('a');
+        let topic = format!("dsh-{}", fake_hex("6136aa0b", 32));
+        let pub_hex = format!("04{}", fake_hex("ab", 64));
+        let priv_hex = fake_hex("cd", 64);
+        let raw = format!(
+            r#"{{
+  "config_path": "C:\\x\\config.json",
+  "token": "{tok}",
+  "listen_host": "0.0.0.0",
+  "ntfy_topic": "{topic}",
+  "vapid_keys": {{
+    "public_hex": "{pub_hex}",
+    "private_hex": "{priv_hex}"
+  }},
+  "push_subs"#
+        );
+        let c = salvage(&raw).expect("truncated config must still yield secrets");
+        assert_eq!(c.token, tok);
+        assert_eq!(c.ntfy_topic.as_deref(), Some(topic.as_str()));
+        let vk = c.vapid_keys.expect("vapid keys must survive");
+        assert_eq!(vk.public_hex, pub_hex);
+        assert_eq!(vk.private_hex, priv_hex);
+    }
+
+    #[test]
+    fn salvage_keeps_secrets_when_a_field_changed_type() {
+        // JSON валиден, но listen_port стал строкой - serde роняет весь файл
+        let tok = fake_token('b');
+        let topic = format!("dsh-{}", fake_hex("7767cc55", 32));
+        let raw = format!(
+            r#"{{
+  "config_path": "x.json",
+  "token": "{tok}",
+  "listen_host": "0.0.0.0",
+  "listen_port": "8460",
+  "staging_path": "stage",
+  "tailscale_ip": "100.1.2.3",
+  "connector_id": "dsh-phone",
+  "created_at_unix": 1,
+  "ntfy_topic": "{topic}"
+}}"#
+        );
+        let c = salvage(&raw).expect("type-drift must not cost the token");
+        assert_eq!(c.token, tok);
+        assert_eq!(c.ntfy_topic.as_deref(), Some(topic.as_str()));
+        // порт сменил тип - остаётся дефолт, это безопасно
+        assert_eq!(c.listen_port, 8460);
+    }
+
+    #[test]
+    fn salvage_refuses_when_there_is_nothing_to_keep() {
+        assert!(salvage("это вообще не json").is_none());
+        assert!(salvage(r#"{"listen_port": 8460}"#).is_none());
+        // короткий токен не берём - это мусор, а не секрет
+        let short = format!(
+            r#"{{"token": "{}"}}"#,
+            fake_token('c').chars().take(8).collect::<String>()
+        );
+        assert!(salvage(&short).is_none());
+    }
+
+    #[test]
+    fn salvage_keeps_devices_even_when_a_field_changed_type() {
+        let tok = fake_token('d');
+        let dev_tok = fake_token('e');
+        let raw = format!(
+            r#"{{
+  "config_path": "x.json",
+  "token": "{tok}",
+  "listen_host": "0.0.0.0",
+  "listen_port": "nope",
+  "staging_path": "stage",
+  "tailscale_ip": "100.1.2.3",
+  "connector_id": "dsh-phone",
+  "created_at_unix": 1,
+  "devices": [{{"name": "iphone", "token": "{dev_tok}", "connector_id": "c1"}}]
+}}"#
+        );
+        let c = salvage(&raw).expect("devices must survive");
+        assert_eq!(c.token, tok);
+        assert_eq!(c.devices.len(), 1);
+        assert_eq!(c.devices[0].name, "iphone");
+        assert_eq!(c.devices[0].token, dev_tok);
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_tmp_behind() {
+        let dir = std::env::temp_dir()
+            .join(format!("dsh-atomic-{}-{}", std::process::id(), new_token()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut c = AppConfig::generate();
+        c.config_path = dir.join("config.json").to_string_lossy().to_string();
+        c.save().unwrap();
+        let updated = fake_token('f');
+        c.token = updated.clone();
+        c.save().unwrap();
+        let raw = fs::read_to_string(&c.config_path).unwrap();
+        assert!(raw.contains(&updated), "second save must land");
+        assert!(
+            !dir.join("config.json.tmp").exists(),
+            "tmp file must not linger"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_config_on_disk_keeps_the_token() {
+        // сквозной сценарий: файл на диске битый -> load_or_init возвращает
+        // прежний токен и оставляет бэкап, а не регенерит новый
+        let dir = std::env::temp_dir().join(format!("dsh-corrupt-{}", new_token()));
+        let _ = fs::create_dir_all(&dir);
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DSH_PHONE_CONFIG_DIR").ok();
+        std::env::set_var("DSH_PHONE_CONFIG_DIR", &dir);
+        let path = dir.join("config.json");
+        let tok = fake_token('a');
+        let broken = format!(r#"{{ "token": "{tok}", "listen_port": "oops""#);
+        fs::write(&path, &broken).unwrap();
+
+        let c = AppConfig::load_or_init();
+        assert_eq!(c.token, tok, "live token must survive a corrupt config");
+        let has_backup = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("config-corrupt-"));
+        assert!(has_backup, "a timestamped backup must be kept");
+
+        let _ = fs::remove_dir_all(&dir);
+        match prev {
+            Some(v) => std::env::set_var("DSH_PHONE_CONFIG_DIR", v),
+            None => std::env::remove_var("DSH_PHONE_CONFIG_DIR"),
+        }
     }
 }

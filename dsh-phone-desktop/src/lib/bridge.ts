@@ -35,6 +35,8 @@ export interface ServerStatus {
   uptime_seconds: number;
   requests: number;
   tls_sha256?: string | null;
+  tls_serving?: string | null;
+  tls_error?: string | null;
   devices?: DeviceBrief[];
 }
 
@@ -42,6 +44,7 @@ export interface TailscaleStatus {
   installed: boolean;
   logged_in: boolean;
   ip: string | null;
+  dns_name?: string | null;
 }
 
 export const getConfig = (): Promise<AppConfig> => invoke("app_config");
@@ -62,6 +65,7 @@ export const getAutostart = (): Promise<boolean> => invoke("get_autostart");
 export const setAutostart = (enabled: boolean): Promise<boolean> => invoke("set_autostart", { enabled });
 export const setStartHidden = (enabled: boolean): Promise<AppConfig> => invoke("set_start_hidden", { enabled });
 export const setTlsEnabled = (enabled: boolean): Promise<AppConfig> => invoke("set_tls_enabled", { enabled });
+export const tlsExportCa = (): Promise<string> => invoke("tls_export_ca");
 export const setAllowedIps = (ips: string[]): Promise<AppConfig> => invoke("set_allowed_ips", { ips });
 export const addDevice = (name: string): Promise<AppConfig> => invoke("add_device", { name });
 export const removeDevice = (token: string): Promise<AppConfig> => invoke("remove_device", { token });

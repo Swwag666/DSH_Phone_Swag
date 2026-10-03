@@ -16,6 +16,7 @@ import {
   setAutostart,
   setStartHidden,
   setTlsEnabled,
+  tlsExportCa,
   setAllowedIps,
   addDevice,
   removeDevice,
@@ -97,9 +98,15 @@ const dict: Record<Lang, Record<string, string>> = {
     startHiddenOn: "старт в трее включён",
     startHiddenOff: "старт с окном",
     tls: "TLS поверх tailscale",
-    tlsHint: "самоподписанный серт, белый список IP, отсечка чужих даже в тейлнете · нужен рестарт узла",
+    tlsHint: "нужен для пушей в браузере телефона · свой CA + серт на IP тейлнета, узел перезапускается сам",
     tlsOn: "TLS включён",
     tlsOff: "TLS выключен",
+    tlsServingHttps: "https поднят",
+    tlsServingHttp: "внимание: узел отдаёт http, а не https",
+    tlsCaExport: "скачать CA на ПК",
+    tlsCaExported: "CA сохранён на рабочий стол",
+    tlsCaFailed: "не удалось сохранить CA",
+    tlsCaHint: "файл dsh-phone-ca.pem на рабочем столе — поставь его на телефон один раз: iOS через «Профиль» (Настройки → Основные → Профиль) и включи полное доверие, Android через установку сертификата CA. Без этого Safari не даст пуши даже после «всё равно перейти».",
     allowlist: "Белый список IP",
     allowlistHint: "кто из тейлнета достучится. пусто = все. можно CIDR",
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
@@ -202,9 +209,15 @@ const dict: Record<Lang, Record<string, string>> = {
     startHiddenOn: "tray start on",
     startHiddenOff: "window start on",
     tls: "TLS over tailscale",
-    tlsHint: "self-signed cert, IP allowlist, drops strangers even inside the tailnet · node restart required",
+    tlsHint: "required for push in the phone browser · own CA + cert for the tailnet IP, node restarts itself",
     tlsOn: "TLS on",
     tlsOff: "TLS off",
+    tlsServingHttps: "https is up",
+    tlsServingHttp: "warning: node is serving http, not https",
+    tlsCaExport: "download CA to this PC",
+    tlsCaExported: "CA saved to the desktop",
+    tlsCaFailed: "could not save the CA",
+    tlsCaHint: "dsh-phone-ca.pem lands on the desktop — install it on the phone once: iOS via a downloaded Profile (Settings → General → Profile) plus full trust, Android as a CA certificate. Without it Safari will not grant push even after tapping through the warning.",
     allowlist: "IP allowlist",
     allowlistHint: "who in the tailnet can reach it. empty = everyone. CIDR allowed",
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
@@ -467,8 +480,20 @@ export default function App() {
       const c = await setTlsEnabled(!(cfg?.tls_enabled));
       setCfg(c);
       fireToast(c.tls_enabled ? t("tlsOn") : t("tlsOff"));
+      // узел перезапустился - подтягиваем честный статус (https поднялся или нет)
+      await new Promise((r) => setTimeout(r, 1200));
+      try { setStatus(await serverStatus()); } catch { /* poll подхватит */ }
     } catch (e) {
       fireToast(t("errPrefix") + e);
+    }
+  };
+
+  const onExportCa = async () => {
+    try {
+      await tlsExportCa();
+      fireToast(t("tlsCaExported"));
+    } catch (e) {
+      fireToast(t("tlsCaFailed") + ": " + e);
     }
   };
 
@@ -1006,10 +1031,32 @@ export default function App() {
                   <div>
                     <div className="text-[13px] text-bone">{t("tls")}</div>
                     <div className="text-[11.5px] text-ash">{t("tlsHint")}</div>
+                    {cfg?.tls_enabled && status?.running && (
+                      <div className="text-[11px] mt-1.5">
+                        <span className={status.tls_serving === "https" ? "text-moss" : "text-ember"}>
+                          {status.tls_serving === "https" ? "● " + t("tlsServingHttps") : "● " + t("tlsServingHttp")}
+                        </span>
+                      </div>
+                    )}
+                    {cfg?.tls_enabled && status?.running && status?.tls_error && (
+                      <div className="text-[11px] text-ember mt-1 break-all">{status.tls_error}</div>
+                    )}
                     {cfg?.tls_enabled && status?.tls_sha256 && (
                       <div className="text-[11px] text-ash mt-1.5">
                         {t("fingerprint")}{" "}
                         <span className="mono-badge">{status.tls_sha256}</span>
+                      </div>
+                    )}
+                    {cfg?.tls_enabled && (
+                      <div className="mt-2">
+                        <button
+                          type="button"
+                          onClick={onExportCa}
+                          className="px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
+                        >
+                          {t("tlsCaExport")}
+                        </button>
+                        <div className="text-[11px] text-ash mt-1.5 leading-relaxed">{t("tlsCaHint")}</div>
                       </div>
                     )}
                   </div>

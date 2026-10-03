@@ -41,11 +41,27 @@ pub struct ServerStatus {
     pub uptime_seconds: u64,
     pub requests: u64,
     pub tls_sha256: Option<String>,
+    /// "https" когда TLS реально поднят, "http" когда запросили TLS, но узел
+    /// отдался обычным HTTP (сертификат не собрался, порт занят).
+    pub tls_serving: Option<String>,
+    /// Причина, по которой TLS не поднялся. None = всё хорошо.
+    pub tls_error: Option<String>,
     pub devices: Vec<gateway::DeviceBrief>,
 }
 
 fn status_of(state: &ServerState) -> ServerStatus {
     let tls_sha256 = crate::tls::cert_sha256();
+    let tls_error = crate::server::tls_runtime_error();
+    let cfg = config::AppConfig::load_or_init();
+    let running = is_running(state);
+    // https только если узел поднят, TLS запрошен И листенер реально поднялся.
+    // У остановленного узла статус не утверждаем вовсе - иначе дашборд рисовал
+    // бы «https поднят» по одному только флагу в конфиге.
+    let tls_serving = if !running {
+        None
+    } else {
+        Some(if cfg.tls_enabled && tls_error.is_none() { "https" } else { "http" }.to_string())
+    };
     match state.running.lock().unwrap().as_ref() {
         Some(s) => ServerStatus {
             running: true,
@@ -53,6 +69,8 @@ fn status_of(state: &ServerState) -> ServerStatus {
             uptime_seconds: s.started_at.elapsed().as_secs(),
             requests: s.requests.load(Ordering::Relaxed),
             tls_sha256,
+            tls_serving,
+            tls_error,
             devices: s.gw.device_briefs(),
         },
         None => ServerStatus {
@@ -61,6 +79,8 @@ fn status_of(state: &ServerState) -> ServerStatus {
             uptime_seconds: 0,
             requests: 0,
             tls_sha256,
+            tls_serving,
+            tls_error,
             devices: Vec::new(),
         },
     }
@@ -112,6 +132,8 @@ fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
     }
 
     install_crypto_provider();
+    // прошлая ошибка TLS не должна переживать рестарт - листенер ещё не пробовал
+    crate::server::clear_tls_runtime();
     let cfg = Arc::new(config::AppConfig::load_or_init());
     let port = cfg.listen_port;
     let started_at = std::time::Instant::now();
@@ -329,6 +351,20 @@ fn set_tls_enabled(enabled: bool, state: State<ServerState>) -> config::AppConfi
     c
 }
 
+/// Копирует локальный CA на рабочий стол и возвращает путь. По https телефон
+/// его скачать не может (не доверяет ещё), а по http файл бы ушёл любому в
+/// сети - поэтому экспорт только с самого ПК, руками.
+#[tauri::command]
+fn tls_export_ca() -> Result<String, String> {
+    let pem = crate::tls::ca_pem().ok_or_else(|| {
+        "CA ещё не создан - включи TLS и дай узлу перезапуститься".to_string()
+    })?;
+    let desktop = dirs::desktop_dir().ok_or("нет рабочего стола")?;
+    let out = desktop.join("dsh-phone-ca.pem");
+    std::fs::write(&out, pem).map_err(|e| e.to_string())?;
+    Ok(out.to_string_lossy().to_string())
+}
+
 #[derive(Serialize, Clone)]
 pub struct PushStatus {
     pub subscriptions: usize,
@@ -448,6 +484,7 @@ pub fn run() {
             set_start_hidden,
             set_allowed_ips,
             set_tls_enabled,
+            tls_export_ca,
             set_ntfy,
             push_status,
             push_test,

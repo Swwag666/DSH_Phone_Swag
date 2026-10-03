@@ -5,7 +5,16 @@
   window[MARK] = true;
 
   var VERSION = 1;
-  var NODE_BASES = ["http://127.0.0.1:8460", "http://localhost:8460"];
+  var NODE_PORT = 8460;
+  // :8460 - основной порт узла (http, либо https когда включён TLS).
+  // :8461 - loopback-only http, который узел поднимает при TLS, чтобы
+  // этот патч не терял бутстрап. Перебираем оба, первый живой wins.
+  var NODE_BASES = [
+    "http://127.0.0.1:" + NODE_PORT,
+    "http://127.0.0.1:" + (NODE_PORT + 1),
+    "http://localhost:" + NODE_PORT,
+    "http://localhost:" + (NODE_PORT + 1)
+  ];
   var ORIGIN_ID = "dsh-desktop";
   var PUSH_DELAY_MS = 600;
   var POLL_IDLE_MS = 900;

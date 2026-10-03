@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 pub fn detect() -> Value {
     let installed = tailscale_installed();
     if !installed {
-        return json!({ "installed": false, "logged_in": false, "ip": Value::Null });
+        return json!({ "installed": false, "logged_in": false, "ip": Value::Null, "dns_name": Value::Null });
     }
     match cli_path() {
         None => json!({ "installed": true, "logged_in": false, "ip": Value::Null }),
@@ -17,10 +17,11 @@ pub fn detect() -> Value {
                 json!({
                     "installed": true,
                     "logged_in": !ip.is_empty(),
-                    "ip": if ip.is_empty() { Value::Null } else { Value::String(ip) }
+                    "ip": if ip.is_empty() { Value::Null } else { Value::String(ip) },
+                    "dns_name": magicdns_name()
                 })
             }
-            _ => json!({ "installed": true, "logged_in": false, "ip": Value::Null }),
+            _ => json!({ "installed": true, "logged_in": false, "ip": Value::Null, "dns_name": Value::Null }),
         },
     }
 }
@@ -45,6 +46,24 @@ pub fn install() -> Result<String, String> {
             format!("winget недоступен ({e}) — поставь tailscale вручную с tailscale.com")
         })?;
     Ok("install started".to_string())
+}
+
+/// MagicDNS fully-qualified name of this machine (desktop-xxx.tailNNN.ts.net).
+/// Stable across tailnet IP reissues, which a raw IP SAN is not - so the TLS
+/// cert carries it too and the phone can connect by name.
+pub fn magicdns_name() -> Option<String> {
+    let exe = cli_path()?;
+    let out = Command::new(&exe).args(["status", "--json"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let name = v.get("Self")?.get("DNSName")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
 }
 
 fn tailscale_installed() -> bool {
