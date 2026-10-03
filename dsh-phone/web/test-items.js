@@ -122,8 +122,9 @@ has("tool card collapsed when done", toolHtml, " hidden");
 has("tool card caret closed", toolHtml, "▸");
 
 const mcpHtml = ir.itemHtml(toolMcp);
-has("mcp card server tag", mcpHtml, "mcp · blender");
-has("mcp card short name", mcpHtml, "bpy_api_lookup");
+has("mcp card tag", mcpHtml, ">mcp<");
+has("mcp card full name", mcpHtml, "mcp__blender__bpy_api_lookup");
+has("mcp card user_prompt desc", mcpHtml, "нужна схема ноды");
 has("mcp card input json", mcpHtml, "ShaderNodeTexSky");
 has("mcp card output", mcpHtml, "all properties");
 
@@ -178,6 +179,104 @@ const bigHtml = ir.itemHtml(big);
 ok("output capped", bigHtml.indexOf("z".repeat(13000)) < 0);
 has("truncation note", bigHtml, "обрезано");
 ok("itemText caps at 4000", ir.itemText(big)[1].length < 4100);
+
+// ---- tool_call реального формата DSH (kind tool_call, toolName, title) ----
+const realTool = {
+  id: "r1", type: "tool", role: "assistant", status: "done", orderSeq: 1,
+  content: {
+    kind: "tool_call", toolName: "read", title: "read", callId: "c9",
+    input: { file_path: "C:\\x\\y.txt", offset: 1, limit: 50 },
+    output: "содержимое файла", result: [{ type: "text", text: "содержимое файла" }], isError: false,
+  },
+};
+const realHtml = ir.itemHtml(realTool);
+has("real tool card full name", realHtml, ">read<");
+has("real tool desc from file_path", realHtml, "C:\\x\\y.txt".replace(/\\\\/g, "\\"));
+has("real tool output", realHtml, "содержимое файла");
+
+const realMcp = {
+  id: "r2", type: "tool", role: "assistant", status: "done", orderSeq: 2,
+  content: {
+    kind: "tool_call", toolName: "mcp__blender__execute_blender_code", title: "mcp__blender__execute_blender_code", callId: "c10",
+    input: { code: "print(1)", user_prompt: "cast_proteje_skin2 - убрать жёлтые пиксели над веками" },
+    output: "done", isError: false,
+  },
+};
+const realMcpHtml = ir.itemHtml(realMcp);
+ok("real mcp detected by toolName prefix", ir.isMcpTool(realMcp.content, "mcp__blender__execute_blender_code"));
+has("real mcp full name in head", realMcpHtml, "mcp__blender__execute_blender_code");
+has("real mcp user_prompt as desc", realMcpHtml, "cast_proteje_skin2 - убрать жёлтые пиксели над веками");
+ok("mcp not mono shell", realMcpHtml.indexOf("toolhead mono") < 0);
+
+// ---- изображения ----
+const imgUser = {
+  id: "im1", type: "message", role: "user", orderSeq: 1,
+  content: { kind: "markdown", format: "markdown", text: "глянь фотку" },
+  attachments: [{ name: "p.jpg", mediaType: "image/jpeg", data: "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" }],
+};
+const imHtml = ir.itemHtml(imgUser);
+has("image rendered as img tag", imHtml, "<img class=\"msg-img\"");
+has("image data url", imHtml, "data:image/jpeg;base64,QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=");
+has("image item text kept", imHtml, "глянь фотку");
+
+const imgBlockUser = {
+  id: "im2", type: "message", role: "user", orderSeq: 2,
+  content: { blocks: [
+    { type: "text", text: "вторая" },
+    { type: "image", source: { type: "base64", mediaType: "image/png", data: "aWFtYmFzZTY0" } },
+  ] },
+};
+const im2Html = ir.itemHtml(imgBlockUser);
+has("block image rendered", im2Html, "data:image/png;base64,aWFtYmFzZTY0");
+has("block text rendered", im2Html, "вторая");
+
+const imgOnly = {
+  id: "im3", type: "message", role: "user", orderSeq: 3,
+  content: { kind: "image", mediaType: "image/webp", data: "aGVsbG93b3JsZA==" },
+};
+ok("image-only item no json junk", ir.itemHtml(imgOnly).indexOf("JSON") < 0 || ir.itemText(imgOnly)[1] !== JSON.stringify(imgOnly.content));
+has("image-only renders img", ir.itemHtml(imgOnly), "data:image/webp;base64,aGVsbG93b3JsZA==");
+
+// ---- dshAttachment: реальный формат DSH (attachmentId sha256, без бинарных данных) ----
+global.window = { __dshAttBase: "/api/attachment?token=T&sessionId=S&" };
+const HEX64 = "fe0ce27f6d70885e68e57dd8a2fc857a75d0474f17eea5542814e6145b73dc5d";
+const attUser = {
+  id: "at1", type: "message", role: "user", orderSeq: 4,
+  content: {
+    kind: "text", format: "text", text: "[изображение]",
+    dshAttachment: { attachmentId: "sha256:" + HEX64, bytes: 14641, height: 512, mediaType: "image/png", name: "shot.png", width: 512 },
+  },
+};
+const attHtml = ir.itemHtml(attUser);
+has("dshAttachment renders via api url", attHtml, "/api/attachment?token=T&amp;sessionId=S&amp;attachmentId=" + HEX64);
+has("dshAttachment mediaType passed", attHtml, "mediaType=image%2Fpng");
+has("dshAttachment alt name", attHtml, "shot.png");
+const attPh = {
+  id: "at1b", type: "message", role: "user", orderSeq: 4,
+  content: { kind: "text", format: "text", text: "[图片暂不支持跨设备预览]",
+    dshAttachment: { attachmentId: "sha256:" + HEX64, bytes: 14641, height: 512, mediaType: "image/png", name: "shot.png", width: 512 } },
+};
+ok("dshAttachment placeholder text hidden", ir.itemText(attPh)[1] === "");
+
+const attTool = {
+  id: "at2", type: "tool", role: "assistant", status: "done", orderSeq: 5,
+  content: {
+    kind: "tool_call", toolName: "read_image", title: "read_image", callId: "c11",
+    input: { file_path: "proteje_skin2_face.png" }, output: "прочитано",
+    result: [
+      { type: "text", text: "прочитано" },
+      { type: "image", attachment: { attachmentId: "sha256:" + HEX64, mediaType: "image/webp", name: "face.webp" } },
+    ],
+    isError: false,
+  },
+};
+const attToolHtml = ir.itemHtml(attTool);
+has("tool result image via api url", attToolHtml, "attachmentId=" + HEX64);
+has("tool image label", attToolHtml, "изображения");
+
+const attBad = { id: "at3", type: "message", role: "user", orderSeq: 6, content: { dshAttachment: { attachmentId: "sha256:zzzz", mediaType: "image/png" } } };
+ok("bad attachmentId skipped", ir.itemHtml(attBad).indexOf("attachmentId=") < 0);
+delete global.window;
 
 console.log("\n" + passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);

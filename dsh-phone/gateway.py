@@ -116,6 +116,8 @@ RPC_WHITELIST = {
     "session.interrupt",
     "session.updateSelections",
     "session.respondInteraction",
+    "session.updateDraft",
+    "session.getDraft",
     "catalog.listModels",
     "catalog.listPermissions",
     "catalog.listAgentPresets",
@@ -292,6 +294,9 @@ class Gateway:
         self.clients = set()  # long-poll waiters: {future}
         self._refresh_pending = False
         self._cand = {}  # sessionId -> candidate from sync inventory.complete
+        # Input-field drafts shared between phone/web clients of this gateway:
+        # sessionId -> {"text": str, "origin": str, "ts": float}
+        self.drafts = {}
 
     def push_event(self, type_, data):
         self.events.append({"ts": time.time(), "type": type_, "data": data})
@@ -477,6 +482,58 @@ class Gateway:
 
     def unwatch(self, sid):
         self.watched.pop(sid, None)
+
+    # ---------------- input-field draft sync ----------------
+    def resolve_draft_key(self, sid):
+        """Accept both the bridge id (sess_dsh_*) and the harness external
+        id (session-<uuid>): drafts are always stored under the bridge id."""
+        if sid in self.drafts:
+            return sid
+        for s in self.sessions:
+            if s.get("externalSessionId") == sid and s.get("sessionId"):
+                return s["sessionId"]
+        return sid
+
+    def external_for(self, sid):
+        for s in self.sessions:
+            if s.get("sessionId") == sid:
+                return s.get("externalSessionId")
+        return None
+
+    def set_draft(self, sid, text, origin):
+        """Store one draft and push it to every connected client."""
+        key = self.resolve_draft_key(sid)
+        self.drafts[key] = {"text": text, "origin": origin, "ts": time.time()}
+        if len(self.drafts) > 64:
+            # drop the oldest entries, keep the map bounded
+            for k in sorted(self.drafts, key=lambda s: self.drafts[s]["ts"])[:-32]:
+                self.drafts.pop(k, None)
+        self.push_event("draft", {
+            "sessionId": key,
+            "externalSessionId": self.external_for(key),
+            "text": text,
+            "origin": origin,
+            "ts": self.drafts[key]["ts"],
+        })
+
+    def clear_draft(self, sid):
+        """A sent message consumed the draft - wipe it on all clients."""
+        key = self.resolve_draft_key(sid)
+        if key in self.drafts:
+            self.drafts.pop(key, None)
+            self.push_event("draft", {
+                "sessionId": key,
+                "externalSessionId": self.external_for(key),
+                "text": "",
+                "origin": "",
+                "ts": time.time(),
+            })
+
+    def get_draft(self, sid):
+        d = self.drafts.get(self.resolve_draft_key(sid))
+        if not d:
+            return {"text": "", "origin": "", "ts": 0.0}
+        return dict(d)
 
 
 def _http_response(status, body_bytes, ctype="application/json; charset=utf-8", extra=None, keep=False):
@@ -673,12 +730,29 @@ async def route(gw, method, path, q, headers, body, keep, conn):
         if m not in RPC_WHITELIST:
             return fail("403 Forbidden", {"ok": False, "error": "method_not_allowed"})
         params = j.get("params") or {}
+        if m == "session.updateDraft" or m == "session.getDraft":
+            # Drafts are gateway-local state, never forwarded to the bridge.
+            sid = str(params.get("sessionId") or "")
+            if not sid:
+                return fail("400 Bad Request", {"ok": False, "error": "no sessionId"})
+            if m == "session.getDraft":
+                return _json("200 OK", {"ok": True, "result": gw.get_draft(sid)}, keep=keep), keep
+            text = params.get("text")
+            if text is None or not isinstance(text, str):
+                text = ""
+            text = text[:10000]
+            origin = str(params.get("deviceId") or params.get("origin") or "")[:64]
+            gw.set_draft(sid, text, origin)
+            return _json("200 OK", {"ok": True, "result": {"saved": True}}, keep=keep), keep
         if m in ("session.startTurn", "session.createAndStart"):
             params = dict(params)
         if m == "session.startTurn" and "clientMessageId" not in params:
             params["clientMessageId"] = uuid.uuid4().hex
         try:
             result = await gw.bridge.request(m, params, timeout=120)
+            if m == "session.startTurn" and isinstance(params.get("sessionId"), str):
+                # the message consumed the draft - wipe it everywhere
+                gw.clear_draft(params["sessionId"])
             return _json("200 OK", {"ok": True, "result": result}, keep=keep), keep
         except Exception as exc:
             return _json("502 Bad Gateway", {"ok": False, "error": str(exc)}, keep=keep), keep
