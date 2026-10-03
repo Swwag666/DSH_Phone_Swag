@@ -301,12 +301,17 @@ pub fn new_token() -> String {
 }
 
 pub fn tailscale_ip() -> String {
-    // 1) авторитетный источник - сам tailscale CLI
+    // 1) авторитетный источник - сам tailscale CLI (hidden: консольное окно не
+    // должно мелькать, этот путь вызывается при каждом load_or_init)
     for exe in [
         r"C:\Program Files\Tailscale\tailscale.exe".to_string(),
         "tailscale.exe".to_string(),
     ] {
-        if let Ok(out) = std::process::Command::new(&exe).arg("ip").arg("-4").output() {
+        if let Ok(out) = crate::tailscale::hidden_command(&exe)
+            .arg("ip")
+            .arg("-4")
+            .output()
+        {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if s.starts_with("100.") {

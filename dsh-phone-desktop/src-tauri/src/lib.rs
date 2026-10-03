@@ -50,36 +50,40 @@ pub struct ServerStatus {
 }
 
 fn status_of(state: &ServerState) -> ServerStatus {
+    // ВНИМАНИЕ: этот вызов происходит на каждый поллинг дашборда (раз в 2с).
+    // Здесь нельзя ни читать конфиг, ни спавнить tailscale.exe - load_or_init()
+    // тянет tailscale_ip(), а консольное приложение на Windows каждый раз
+    // рисует и гасит окно терминала. Раньше так и было: терминал мелькал
+    // бесконечно. Берём всё из уже загруженного состояния узла.
     let tls_sha256 = crate::tls::cert_sha256();
     let tls_error = crate::server::tls_runtime_error();
-    let cfg = config::AppConfig::load_or_init();
-    let running = is_running(state);
-    // https только если узел поднят, TLS запрошен И листенер реально поднялся.
-    // У остановленного узла статус не утверждаем вовсе - иначе дашборд рисовал
-    // бы «https поднят» по одному только флагу в конфиге.
-    let tls_serving = if !running {
-        None
-    } else {
-        Some(if cfg.tls_enabled && tls_error.is_none() { "https" } else { "http" }.to_string())
-    };
     match state.running.lock().unwrap().as_ref() {
-        Some(s) => ServerStatus {
-            running: true,
-            port: s.port,
-            uptime_seconds: s.started_at.elapsed().as_secs(),
-            requests: s.requests.load(Ordering::Relaxed),
-            tls_sha256,
-            tls_serving,
-            tls_error,
-            devices: s.gw.device_briefs(),
-        },
+        Some(s) => {
+            // https только если TLS запрошен И листенер реально поднялся
+            let tls_serving = if s.gw.cfg.tls_enabled && tls_error.is_none() {
+                "https"
+            } else {
+                "http"
+            };
+            ServerStatus {
+                running: true,
+                port: s.port,
+                uptime_seconds: s.started_at.elapsed().as_secs(),
+                requests: s.requests.load(Ordering::Relaxed),
+                tls_sha256,
+                tls_serving: Some(tls_serving.to_string()),
+                tls_error,
+                devices: s.gw.device_briefs(),
+            }
+        }
         None => ServerStatus {
             running: false,
             port: 8460,
             uptime_seconds: 0,
             requests: 0,
             tls_sha256,
-            tls_serving,
+            // узел не поднят - утверждать схему нечего
+            tls_serving: None,
             tls_error,
             devices: Vec::new(),
         },
@@ -260,7 +264,7 @@ fn heal_tailnet() -> serde_json::Value {
         }
     };
     let run = |args: &[&str]| -> bool {
-        std::process::Command::new(&ts)
+        crate::tailscale::hidden_command(&ts)
             .args(args)
             .output()
             .map(|o| o.status.success())
@@ -284,7 +288,7 @@ fn tailscale_install() -> Result<String, String> {
 
 #[tauri::command]
 fn get_autostart() -> bool {
-    let out = std::process::Command::new("reg")
+    let out = crate::tailscale::hidden_command("reg")
         .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "DSHPhone"])
         .output();
     match out {
@@ -304,7 +308,7 @@ fn autostart_command_value() -> String {
 fn set_autostart(enabled: bool) -> Result<bool, String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
     if enabled {
-        let out = std::process::Command::new("reg")
+        let out = crate::tailscale::hidden_command("reg")
             .args(["add", key, "/v", "DSHPhone", "/t", "REG_SZ", "/d", &autostart_command_value(), "/f"])
             .output()
             .map_err(|e| e.to_string())?;
@@ -312,7 +316,7 @@ fn set_autostart(enabled: bool) -> Result<bool, String> {
             return Err(format!("reg add failed: {}", String::from_utf8_lossy(&out.stderr)));
         }
     } else {
-        let out = std::process::Command::new("reg")
+        let out = crate::tailscale::hidden_command("reg")
             .args(["delete", key, "/v", "DSHPhone", "/f"])
             .output()
             .map_err(|e| e.to_string())?;

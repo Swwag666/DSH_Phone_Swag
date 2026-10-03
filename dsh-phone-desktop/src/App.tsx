@@ -1027,42 +1027,50 @@ export default function App() {
                     <span className="knob" />
                   </button>
                 </div>
-                <div className="flex items-center justify-between py-2.5 gap-3">
-                  <div>
-                    <div className="text-[13px] text-bone">{t("tls")}</div>
-                    <div className="text-[11.5px] text-ash">{t("tlsHint")}</div>
-                    {cfg?.tls_enabled && status?.running && (
-                      <div className="text-[11px] mt-1.5">
-                        <span className={status.tls_serving === "https" ? "text-moss" : "text-ember"}>
-                          {status.tls_serving === "https" ? "● " + t("tlsServingHttps") : "● " + t("tlsServingHttp")}
-                        </span>
-                      </div>
-                    )}
-                    {cfg?.tls_enabled && status?.running && status?.tls_error && (
-                      <div className="text-[11px] text-ember mt-1 break-all">{status.tls_error}</div>
-                    )}
-                    {cfg?.tls_enabled && status?.tls_sha256 && (
-                      <div className="text-[11px] text-ash mt-1.5">
-                        {t("fingerprint")}{" "}
-                        <span className="mono-badge">{status.tls_sha256}</span>
-                      </div>
-                    )}
-                    {cfg?.tls_enabled && (
-                      <div className="mt-2">
+                <div className="py-2.5">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-bone">{t("tls")}</div>
+                      <div className="text-[11.5px] text-ash">{t("tlsHint")}</div>
+                    </div>
+                    <button type="button" onClick={onToggleTls} className={"shrink-0 toggle" + (cfg?.tls_enabled ? " on" : "")} aria-pressed={!!cfg?.tls_enabled}>
+                      <span className="knob" />
+                    </button>
+                  </div>
+                  {cfg?.tls_enabled && (
+                    <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-[11.5px]">
+                            {status?.running ? (
+                              <span className={status.tls_serving === "https" ? "text-moss" : "text-ember"}>
+                                {status.tls_serving === "https" ? "● " + t("tlsServingHttps") : "● " + t("tlsServingHttp")}
+                              </span>
+                            ) : (
+                              <span className="text-ash">● {t("nodeOff")}</span>
+                            )}
+                          </div>
+                          {status?.tls_sha256 && (
+                            <div className="text-[11px] text-ash mt-1.5">
+                              {t("fingerprint")}{" "}
+                              <span className="mono-badge break-all">{status.tls_sha256}</span>
+                            </div>
+                          )}
+                        </div>
                         <button
                           type="button"
                           onClick={onExportCa}
-                          className="px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
+                          className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
                         >
                           {t("tlsCaExport")}
                         </button>
-                        <div className="text-[11px] text-ash mt-1.5 leading-relaxed">{t("tlsCaHint")}</div>
                       </div>
-                    )}
-                  </div>
-                  <button type="button" onClick={onToggleTls} className={"toggle" + (cfg?.tls_enabled ? " on" : "")} aria-pressed={!!cfg?.tls_enabled}>
-                    <span className="knob" />
-                  </button>
+                      {status?.tls_error && (
+                        <div className="text-[11px] text-ember mt-2 break-all">{status.tls_error}</div>
+                      )}
+                      <div className="text-[11px] text-ash mt-2 leading-relaxed">{t("tlsCaHint")}</div>
+                    </div>
+                  )}
                 </div>
                 <div className="py-2.5">
                   <div className="flex items-center justify-between gap-3">

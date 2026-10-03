@@ -3,6 +3,25 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+/// Console apps spawned from a GUI process flash their own window on Windows.
+/// The dashboard polls status every 2s, and each `tailscale.exe`/`where` call
+/// used to paint a terminal box that immediately vanished - so the user saw a
+/// window flickering forever. Every background probe goes through this helper
+/// (winget is the exception: its installer raises UAC and must stay visible).
+#[cfg(windows)]
+pub fn hidden_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut c = Command::new(program);
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
+}
+
+#[cfg(not(windows))]
+pub fn hidden_command(program: &str) -> Command {
+    Command::new(program)
+}
+
 /// Reports whether Tailscale is installed, logged in and its current IP.
 pub fn detect() -> Value {
     let installed = tailscale_installed();
@@ -11,7 +30,7 @@ pub fn detect() -> Value {
     }
     match cli_path() {
         None => json!({ "installed": true, "logged_in": false, "ip": Value::Null }),
-        Some(exe) => match Command::new(&exe).args(["ip", "-4"]).output() {
+        Some(exe) => match hidden_command(&exe).args(["ip", "-4"]).output() {
             Ok(o) if o.status.success() => {
                 let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 json!({
@@ -53,7 +72,7 @@ pub fn install() -> Result<String, String> {
 /// cert carries it too and the phone can connect by name.
 pub fn magicdns_name() -> Option<String> {
     let exe = cli_path()?;
-    let out = Command::new(&exe).args(["status", "--json"]).output().ok()?;
+    let out = hidden_command(&exe).args(["status", "--json"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -88,7 +107,7 @@ pub(crate) fn cli_path() -> Option<String> {
             return Some(c.to_string());
         }
     }
-    let out = Command::new("where").arg("tailscale").output().ok()?;
+    let out = hidden_command("where").arg("tailscale").output().ok()?;
     if !out.status.success() {
         return None;
     }
