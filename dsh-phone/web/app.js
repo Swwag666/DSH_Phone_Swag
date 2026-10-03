@@ -1439,6 +1439,29 @@ function pushSupported() {
   return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 }
 
+// Почему не работает: точная причина вместо «браузер не умеет».
+function pushUnsupportedReason() {
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const standalone =
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true;
+  const secure = window.isSecureContext === true;
+  if (isIOS && !standalone) {
+    return "iOS: пуши только из установленного приложения - Safari → Поделиться → «На экран Домой», открой оттуда";
+  }
+  if (!secure && location.protocol !== "https:") {
+    return "нужен HTTPS: включи тумблер TLS в конфиге узла и зайди по https:// (пуши в браузерах только по https)";
+  }
+  if (!("Notification" in window) || !("PushManager" in window)) {
+    return "этот браузер без Web Push - поставь PWA на домашний экран или поставь ntfy-приложение";
+  }
+  if (!("serviceWorker" in navigator)) {
+    return "браузер без Service Worker - Web Push недоступен";
+  }
+  return "браузер не умеет пушей";
+}
+
 // The SW re-subscribes on its own (pushsubscriptionchange) and needs the token,
 // which localStorage cannot provide to it - so we mirror it into IndexedDB.
 function idbSetToken() {
@@ -1457,7 +1480,7 @@ function idbSetToken() {
 function pushStateLabel() {
   const el = $("push-state");
   if (!el) return;
-  if (!pushSupported()) { el.textContent = "браузер не умеет"; return; }
+  if (!pushSupported()) { el.textContent = "нет"; return; }
   navigator.serviceWorker.ready
     .then((reg) => reg.pushManager.getSubscription())
     .then((s) => { pushSub = s || null; el.textContent = s ? "вкл" : "выкл"; })
@@ -1465,7 +1488,8 @@ function pushStateLabel() {
 }
 
 async function enablePush() {
-  if (!pushSupported()) { status("пуши: этот браузер не умеет"); return; }
+  if (!pushSupported()) { status("пуши: " + pushUnsupportedReason()); return; }
+  if (window.isSecureContext !== true) { status("пуши: " + pushUnsupportedReason()); return; }
   let perm = "default";
   try { perm = await Notification.requestPermission(); } catch (_) {}
   if (perm !== "granted") { status("пуши: разрешение не дано"); return; }
