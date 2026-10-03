@@ -11,26 +11,37 @@ fn key_path() -> std::path::PathBuf {
     config_dir().join("tls_key.pem")
 }
 
+/// Records which tailscale IP the cert was minted for. The IP is not stable
+/// (tailnet reissues happen), and a cert whose SAN no longer matches makes every
+/// browser refuse the connection - so we regenerate on mismatch instead of
+/// serving a stale cert forever.
+fn cert_ip_marker() -> std::path::PathBuf {
+    config_dir().join("tls_cert.ip")
+}
+
 /// Generates the self-signed cert (with the tailscale IP in the SAN) if it is
-/// missing, then returns an axum-server rustls config ready for `bind_rustls`.
+/// missing or stale, then returns an axum-server rustls config for `bind_rustls`.
 pub async fn rustls_config(
     cfg: &AppConfig,
 ) -> Result<axum_server::tls_rustls::RustlsConfig, String> {
     let cp = cert_path();
     let kp = key_path();
-    if !cp.exists() || !kp.exists() {
-        let ip = cfg
-            .tailscale_ip
-            .parse::<IpAddr>()
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        generate(&cp, &kp, ip)?;
+    let ip = cfg
+        .tailscale_ip
+        .parse::<IpAddr>()
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let stale = std::fs::read_to_string(cert_ip_marker())
+        .map(|s| s.trim() != cfg.tailscale_ip.trim())
+        .unwrap_or(true);
+    if !cp.exists() || !kp.exists() || stale {
+        generate(&cp, &kp, ip, &cfg.tailscale_ip)?;
     }
     axum_server::tls_rustls::RustlsConfig::from_pem_file(cp, kp)
         .await
         .map_err(|e| e.to_string())
 }
 
-fn generate(cp: &Path, kp: &Path, ip: IpAddr) -> Result<(), String> {
+fn generate(cp: &Path, kp: &Path, ip: IpAddr, marker: &str) -> Result<(), String> {
     let mut params = rcgen::CertificateParams::default();
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2035, 1, 1);
@@ -38,6 +49,12 @@ fn generate(cp: &Path, kp: &Path, ip: IpAddr) -> Result<(), String> {
         .distinguished_name
         .push(rcgen::DnType::CommonName, "dsh-phone");
     params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+    // Loopback too, so the node can be smoke-tested over https locally.
+    params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(IpAddr::V4(
+            std::net::Ipv4Addr::LOCALHOST,
+        )));
     params.subject_alt_names.push(rcgen::SanType::DnsName(
         rcgen::Ia5String::try_from("localhost").map_err(|e| e.to_string())?,
     ));
@@ -48,6 +65,8 @@ fn generate(cp: &Path, kp: &Path, ip: IpAddr) -> Result<(), String> {
     }
     std::fs::write(cp, cert.pem()).map_err(|e| e.to_string())?;
     std::fs::write(kp, key.serialize_pem()).map_err(|e| e.to_string())?;
+    std::fs::write(cert_ip_marker(), marker).map_err(|e| e.to_string())?;
+    eprintln!("dsh-phone: minted self-signed cert for {ip}");
     Ok(())
 }
 

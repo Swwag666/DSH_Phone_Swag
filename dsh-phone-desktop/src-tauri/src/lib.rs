@@ -93,11 +93,25 @@ fn stop_inner(state: &ServerState) {
     }
 }
 
+/// rustls 0.23 needs exactly one process-level CryptoProvider. Our dependency
+/// graph enables both `ring` (via reqwest/rcgen) and `aws-lc-rs` (via
+/// axum-server), and auto-detection then *panics* inside the tokio worker -
+/// taking the listener down silently, so the node stayed up while serving
+/// nothing. Installing `ring` up front makes the choice explicit.
+fn install_crypto_provider() {
+    use std::sync::Once;
+    static DONE: Once = Once::new();
+    DONE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
     if is_running(state) {
         return Ok(status_of(state));
     }
 
+    install_crypto_provider();
     let cfg = Arc::new(config::AppConfig::load_or_init());
     let port = cfg.listen_port;
     let started_at = std::time::Instant::now();
@@ -305,10 +319,13 @@ fn set_allowed_ips(ips: Vec<String>) -> config::AppConfig {
 }
 
 #[tauri::command]
-fn set_tls_enabled(enabled: bool) -> config::AppConfig {
+fn set_tls_enabled(enabled: bool, state: State<ServerState>) -> config::AppConfig {
     let mut c = config::AppConfig::load_or_init();
     c.tls_enabled = enabled;
     let _ = c.save();
+    // Without this the old listener keeps serving the previous scheme: the
+    // toggle looked like it did nothing until the next node restart.
+    restart_if_running(&state);
     c
 }
 

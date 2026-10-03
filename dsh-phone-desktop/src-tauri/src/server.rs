@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -60,6 +60,17 @@ fn static_response(ctype: &'static str, body: String) -> Response {
         .unwrap()
 }
 
+/// What the listener is actually serving right now. The config says what the
+/// user *asked for*; this says what happened. When TLS setup fails we fall back
+/// to plain HTTP, and without this the dashboard would keep claiming "on".
+static TLS_RUNTIME: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_tls_runtime(v: Option<String>) {
+    if let Ok(mut g) = TLS_RUNTIME.lock() {
+        *g = v;
+    }
+}
+
 async fn health(State(gw): State<Arc<Gateway>>) -> Response {
     let ping = gw.main_hub().plugin_ping_snapshot();
     let mut obj = json!({
@@ -81,6 +92,14 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Response {
     });
     if gw.cfg.tls_enabled {
         obj["tls_sha256"] = json!(crate::tls::cert_sha256());
+        if let Ok(g) = TLS_RUNTIME.lock() {
+            if let Some(err) = g.as_ref() {
+                obj["tls_error"] = json!(err);
+                obj["tls_serving"] = json!("http");
+            } else {
+                obj["tls_serving"] = json!("https");
+            }
+        }
     }
     json_status(StatusCode::OK, obj)
 }
@@ -121,9 +140,16 @@ async fn attachment(
             return json_status(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "attachment not found" }))
         }
     };
-    let ctype = match q.get("mediaType").and_then(|m| Some(m.clone())) {
-        Some(m) if m.starts_with("image/") => m,
-        _ => sniff_content_type(&bytes).to_string(),
+    // mediaType is caller-supplied, so only honour a known image type and
+    // fall back to sniffing the bytes otherwise (also blocks header injection).
+    let ctype = match q.get("mediaType").map(|m| m.as_str()) {
+        Some("image/png") => "image/png",
+        Some("image/jpeg") | Some("image/jpg") => "image/jpeg",
+        Some("image/webp") => "image/webp",
+        Some("image/gif") => "image/gif",
+        Some("image/avif") => "image/avif",
+        Some("image/svg+xml") => "image/svg+xml",
+        _ => sniff_content_type(&bytes),
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -718,27 +744,36 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
     if gw.cfg.tls_enabled {
         match crate::tls::rustls_config(&gw.cfg).await {
             Ok(config) => {
-                eprintln!(
-                    "dsh-phone: TLS on :{port} sha256={}",
-                    crate::tls::cert_sha256().unwrap_or_default()
-                );
+                let sha = crate::tls::cert_sha256().unwrap_or_default();
+                eprintln!("dsh-phone: TLS on :{port} sha256={sha}");
                 let handle = axum_server::Handle::new();
                 let h2 = handle.clone();
                 tokio::spawn(async move {
                     let _ = rx.recv().await;
                     h2.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
                 });
-                let _ = axum_server::bind_rustls(addr, config)
+                let served = axum_server::bind_rustls(addr, config)
                     .handle(handle)
                     .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                     .await;
+                match served {
+                    Ok(()) => set_tls_runtime(None),
+                    Err(e) => {
+                        let msg = format!("TLS listener failed: {e}");
+                        eprintln!("dsh-phone: {msg}");
+                        set_tls_runtime(Some(msg));
+                    }
+                }
             }
             Err(e) => {
+                let msg = e.to_string();
                 eprintln!("dsh-phone: TLS setup failed ({e}); serving plain HTTP");
+                set_tls_runtime(Some(msg));
                 serve_http(app, addr, rx).await;
             }
         }
     } else {
+        set_tls_runtime(None);
         serve_http(app, addr, rx).await;
     }
 }

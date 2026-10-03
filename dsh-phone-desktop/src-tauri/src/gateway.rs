@@ -897,6 +897,7 @@ mod tests {
             "C:/nonexistent/endpoint.json".into(),
             64,
             1.0,
+            PushRouter::new(),
         );
         hub
     }
@@ -978,7 +979,7 @@ mod tests {
         assert!(hub.plugin_ping_snapshot().is_none());
         hub.set_plugin_ping(json!({ "origin": "dsh-desktop", "hasSession": true, "sessionId": "session-x" }));
         let snap = hub.plugin_ping_snapshot().expect("ping stored");
-        assert_eq!(snap["hasSession"].as_bool().unwrap(), true);
+        assert!(snap["hasSession"].as_bool().unwrap());
         assert_eq!(snap["sessionId"].as_str().unwrap(), "session-x");
     }
 

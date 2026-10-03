@@ -1,7 +1,7 @@
 [package]
 name = "dsh-phone"
 version = "0.3.0"
-description = "DSH Phone - Ð»Ð¾ÐºÐ°Ð»ÑŒÐ½Ñ‹Ð¹ Ð¼Ð¾ÑÑ‚ Ð¼ÐµÐ¶Ð´Ñƒ DSH Desktop Ð¸ Ñ‚ÐµÐ»ÐµÑ„Ð¾Ð½Ð¾Ð¼"
+description = "DSH Phone - local bridge between DSH Desktop and your phone"
 authors = ["Rustvy"]
 edition = "2021"
 rust-version = "1.77"
@@ -28,6 +28,11 @@ sha2 = "0.10"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rcgen = "0.13"
 rustls-pemfile = "2"
+# Explicit dependency so we can install a CryptoProvider ourselves. Feature
+# unification leaves both `aws-lc-rs` (axum-server) and `ring` (reqwest/rcgen)
+# enabled, and rustls 0.23 *panics* at runtime instead of picking one - which
+# silently killed the whole TLS listener. We call install_default() at startup.
+rustls = { version = "0.23", features = ["ring", "std", "tls12"] }
 
 # push notifications: Web Push (VAPID + RFC 8291 aes128gcm) and ntfy
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "arithmetic"] }
