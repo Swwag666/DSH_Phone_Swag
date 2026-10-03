@@ -271,9 +271,15 @@ function cleanText(s) {
 }
 
 // ---------- chat ----------
+function updateAttBase() {
+  // префикс URL для картинок-вложений: /api/attachment с токеном и сессией
+  window.__dshAttBase = "/api/attachment?token=" + encodeURIComponent(token || "") + "&sessionId=" + encodeURIComponent(activeSession || "") + "&";
+}
+
 function openChat(s) {
   if (activeSession) watch(activeSession, true);
   activeSession = s.sessionId;
+  updateAttBase();
   markRead(s.sessionId, orderTs(s));
   knownStatus = "";
   allowTw = false;

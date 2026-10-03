@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,7 @@ const WHITELIST: &[&str] = &[
     "session.interrupt",
     "session.updateSelections",
     "session.respondInteraction",
+    "session.pluginPing",
     "session.updateDraft",
     "session.getDraft",
     "catalog.listModels",
@@ -59,6 +61,7 @@ fn static_response(ctype: &'static str, body: String) -> Response {
 }
 
 async fn health(State(gw): State<Arc<Gateway>>) -> Response {
+    let ping = gw.main_hub().plugin_ping_snapshot();
     let mut obj = json!({
         "ok": true,
         "runtime": "rust",
@@ -69,6 +72,7 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Response {
         "tailscale": gw.cfg.tailscale_ip,
         "tls": if gw.cfg.tls_enabled { "on" } else { "off" },
         "allowlist": gw.cfg.allowed_ips,
+        "plugin": ping,
         "devices": gw.device_briefs().iter().map(|d| json!({
             "name": d.name,
             "connector": d.connector_id,
@@ -79,6 +83,70 @@ async fn health(State(gw): State<Arc<Gateway>>) -> Response {
         obj["tls_sha256"] = json!(crate::tls::cert_sha256());
     }
     json_status(StatusCode::OK, obj)
+}
+
+/// Serves attachment binaries straight from the DSH content-addressed store
+/// (~/.dsh/attachments/v1/objects/<hex[0..2]>/<sha256-hex>) so the phone can
+/// render photos that DSH Desktop received or produced.
+async fn attachment(
+    State(gw): State<Arc<Gateway>>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: header::HeaderMap,
+) -> Response {
+    let token = headers
+        .get("x-dsh-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| q.get("token").cloned())
+        .unwrap_or_default();
+    if gw.find_hub(&token).is_none() {
+        return json_status(StatusCode::UNAUTHORIZED, json!({ "ok": false, "error": "unauthorized" }));
+    }
+    let raw = q.get("attachmentId").cloned().unwrap_or_default();
+    let hexid = raw.strip_prefix("sha256:").unwrap_or(&raw).to_string();
+    if hexid.len() != 64 || !hexid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return json_status(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "bad attachmentId" }));
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let path = home
+        .join(".dsh")
+        .join("attachments")
+        .join("v1")
+        .join("objects")
+        .join(&hexid[0..2])
+        .join(&hexid);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => {
+            return json_status(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "attachment not found" }))
+        }
+    };
+    let ctype = match q.get("mediaType").and_then(|m| Some(m.clone())) {
+        Some(m) if m.starts_with("image/") => m,
+        _ => sniff_content_type(&bytes).to_string(),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+fn sniff_content_type(b: &[u8]) -> &'static str {
+    if b.len() >= 8 && b[0] == 0x89 && b[1] == b'P' && b[2] == b'N' && b[3] == b'G' {
+        return "image/png";
+    }
+    if b.len() >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
+        return "image/jpeg";
+    }
+    if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if b.len() >= 6 && (&b[0..6] == b"GIF87a" || &b[0..6] == b"GIF89a") {
+        return "image/gif";
+    }
+    "application/octet-stream"
 }
 
 #[derive(Deserialize)]
@@ -113,6 +181,18 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
         json!({})
     };
     // Drafts are gateway-local state, never forwarded to the bridge.
+    if b.method == "session.pluginPing" {
+        // Plugin heartbeat: proves whether the DSH-side client bound its
+        // session id and composer element. Diagnostics only, never forwarded.
+        let mut payload = json!({ "origin": "unknown", "ts": now_ts() });
+        if let Some(o) = params.as_object() {
+            let mut m = o.clone();
+            m.insert("ts".to_string(), json!(now_ts()));
+            payload = Value::Object(m);
+        }
+        hub.set_plugin_ping(payload);
+        return json_status(StatusCode::OK, json!({ "ok": true, "result": { "saved": true } }));
+    }
     if b.method == "session.updateDraft" || b.method == "session.getDraft" {
         let sid = params
             .get("sessionId")
@@ -125,8 +205,12 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
                 json!({ "ok": false, "error": "no sessionId" }),
             );
         }
+        // Accept both the bridge id (sess_dsh_*) and the harness external id
+        // (session-uuid) so the DSH Desktop composer shares one draft slot
+        // with the PWA.
+        let key = hub.resolve_draft_key(&sid);
         if b.method == "session.getDraft" {
-            return json_status(StatusCode::OK, json!({ "ok": true, "result": hub.get_draft(&sid) }));
+            return json_status(StatusCode::OK, json!({ "ok": true, "result": hub.get_draft(&key) }));
         }
         let text = params
             .get("text")
@@ -139,7 +223,7 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        hub.set_draft(&sid, &text, &origin);
+        hub.set_draft(&key, &text, &origin);
         return json_status(StatusCode::OK, json!({ "ok": true, "result": { "saved": true } }));
     }
     if b.method == "session.startTurn" {
@@ -432,12 +516,90 @@ async fn ip_filter(State(gw): State<Arc<Gateway>>, req: Request, next: Next) -> 
     next.run(req).await
 }
 
+/// Loopback browser origins (the DSH Desktop web GUI lives on a random
+/// 127.0.0.1 port) are mirrored back; everything else gets no CORS headers.
+fn cors_origin_mirror(origin: Option<&str>) -> Option<String> {
+    let o = origin?;
+    let after = o.strip_prefix("http://")?;
+    let host = after.split(':').next().unwrap_or("");
+    if host == "127.0.0.1" || host == "localhost" {
+        Some(o.to_string())
+    } else {
+        None
+    }
+}
+
+async fn cors_layer(req: Request, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let is_api = req.uri().path().starts_with("/api/");
+    let allowed = cors_origin_mirror(origin.as_deref());
+    if req.method() == axum::http::Method::OPTIONS && is_api {
+        return match allowed {
+            Some(o) => Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("Access-Control-Allow-Origin", o)
+                .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                .header("Access-Control-Allow-Headers", "content-type, x-dsh-token")
+                .header("Access-Control-Max-Age", "86400")
+                .body(Body::empty())
+                .unwrap(),
+            None => json_status(
+                StatusCode::FORBIDDEN,
+                json!({ "ok": false, "error": "origin_not_allowed" }),
+            ),
+        };
+    }
+    let mut res = next.run(req).await;
+    if is_api {
+        if let Some(o) = allowed {
+            if let Ok(v) = header::HeaderValue::from_str(&o) {
+                res.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+            }
+        }
+    }
+    res
+}
+
+/// Loopback-only, tokenless bootstrap for the DSH Desktop composer patch:
+/// hands the node token and port to a page that already runs on this machine.
+async fn draft_config(
+    State(gw): State<Arc<Gateway>>,
+    ConnectInfo(ci): ConnectInfo<SocketAddr>,
+    headers: header::HeaderMap,
+) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !(ci.ip().is_loopback() && cors_origin_mirror(Some(origin)).is_some()) {
+        return json_status(
+            StatusCode::FORBIDDEN,
+            json!({ "ok": false, "error": "forbidden" }),
+        );
+    }
+    json_status(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "token": gw.cfg.token,
+            "port": gw.cfg.listen_port,
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    )
+}
+
 pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
     let port = gw.cfg.listen_port;
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/attachment", get(attachment))
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
+        .route("/api/draft-config", get(draft_config))
         .route("/api/watch", post(watch))
         .route(
             "/api/upload",
@@ -447,6 +609,7 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .fallback(static_fallback)
         .layer(middleware::from_fn_with_state(gw.clone(), count_reqs))
         .layer(middleware::from_fn_with_state(gw.clone(), ip_filter))
+        .layer(middleware::from_fn(cors_layer))
         .with_state(gw.clone());
 
     // Honour listen_host from the config (it was previously ignored and the
@@ -526,8 +689,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whitelist_is_18_methods() {
-        assert_eq!(WHITELIST.len(), 18);
+    fn whitelist_is_19_methods() {
+        assert_eq!(WHITELIST.len(), 19);
         // the README/agent docs must match this count
     }
 
@@ -577,6 +740,23 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), WHITELIST.len());
+    }
+
+    #[test]
+    fn cors_origin_mirror_accepts_loopback_only() {
+        assert_eq!(
+            cors_origin_mirror(Some("http://127.0.0.1:43120")).as_deref(),
+            Some("http://127.0.0.1:43120")
+        );
+        assert_eq!(
+            cors_origin_mirror(Some("http://localhost:5173")).as_deref(),
+            Some("http://localhost:5173")
+        );
+        // remote origins, https, and missing origins get nothing
+        assert!(cors_origin_mirror(Some("http://100.100.134.55:8460")).is_none());
+        assert!(cors_origin_mirror(Some("https://evil.example")).is_none());
+        assert!(cors_origin_mirror(Some("http://127.0.0.1.evil.example")).is_none());
+        assert!(cors_origin_mirror(None).is_none());
     }
 
     #[test]

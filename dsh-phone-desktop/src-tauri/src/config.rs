@@ -67,6 +67,13 @@ fn default_staging_retention_secs() -> u64 {
 }
 
 pub fn config_dir() -> PathBuf {
+    // Test/local override: keeps `cargo test` from ever touching the real
+    // user config (a regression here once regenerated a live token).
+    if let Ok(dir) = std::env::var("DSH_PHONE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("dsh-phone")
@@ -242,6 +249,9 @@ mod tests {
 
     #[test]
     fn gen_writes_file() {
+        let dir = std::env::temp_dir().join(format!("dsh-phone-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("DSH_PHONE_CONFIG_DIR", &dir);
         let c = AppConfig::generate();
         c.save().unwrap();
         let p = std::path::Path::new(&c.config_path);
@@ -249,6 +259,7 @@ mod tests {
         println!("token_len={} tailscale={}", c.token.len(), c.tailscale_ip);
         assert!(p.exists());
         assert_eq!(c.token.len(), 32);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

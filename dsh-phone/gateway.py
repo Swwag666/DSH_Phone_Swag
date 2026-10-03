@@ -484,33 +484,53 @@ class Gateway:
         self.watched.pop(sid, None)
 
     # ---------------- input-field draft sync ----------------
+    def resolve_draft_key(self, sid):
+        """Accept both the bridge id (sess_dsh_*) and the harness external
+        id (session-<uuid>): drafts are always stored under the bridge id."""
+        if sid in self.drafts:
+            return sid
+        for s in self.sessions:
+            if s.get("externalSessionId") == sid and s.get("sessionId"):
+                return s["sessionId"]
+        return sid
+
+    def external_for(self, sid):
+        for s in self.sessions:
+            if s.get("sessionId") == sid:
+                return s.get("externalSessionId")
+        return None
+
     def set_draft(self, sid, text, origin):
         """Store one draft and push it to every connected client."""
-        self.drafts[sid] = {"text": text, "origin": origin, "ts": time.time()}
+        key = self.resolve_draft_key(sid)
+        self.drafts[key] = {"text": text, "origin": origin, "ts": time.time()}
         if len(self.drafts) > 64:
             # drop the oldest entries, keep the map bounded
             for k in sorted(self.drafts, key=lambda s: self.drafts[s]["ts"])[:-32]:
                 self.drafts.pop(k, None)
         self.push_event("draft", {
-            "sessionId": sid,
+            "sessionId": key,
+            "externalSessionId": self.external_for(key),
             "text": text,
             "origin": origin,
-            "ts": self.drafts[sid]["ts"],
+            "ts": self.drafts[key]["ts"],
         })
 
     def clear_draft(self, sid):
         """A sent message consumed the draft - wipe it on all clients."""
-        if sid in self.drafts:
-            self.drafts.pop(sid, None)
+        key = self.resolve_draft_key(sid)
+        if key in self.drafts:
+            self.drafts.pop(key, None)
             self.push_event("draft", {
-                "sessionId": sid,
+                "sessionId": key,
+                "externalSessionId": self.external_for(key),
                 "text": "",
                 "origin": "",
                 "ts": time.time(),
             })
 
     def get_draft(self, sid):
-        d = self.drafts.get(sid)
+        d = self.drafts.get(self.resolve_draft_key(sid))
         if not d:
             return {"text": "", "origin": "", "ts": 0.0}
         return dict(d)
