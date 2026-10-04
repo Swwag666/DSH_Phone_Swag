@@ -9,7 +9,7 @@ mod tailscale;
 mod tls;
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -23,7 +23,14 @@ use tauri::{
 pub struct RunningServer {
     pub handle: tauri::async_runtime::JoinHandle<()>,
     pub bg: Vec<tauri::async_runtime::JoinHandle<()>>,
-    pub shutdown: tokio::sync::mpsc::Sender<()>,
+    /// L1: watch, а не mpsc(1). mpsc-канал ёмкости 1 заполнялся, если сигнал
+    /// приходил дважды, try_send молча возвращал Err - и graceful shutdown не
+    /// случался вообще. watch мультикастовый и «не заполняется» по построению.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
+    /// H7: гаснет, когда листенер не смог забиндиться. Без него status_of
+    /// печатал running:true с растущим uptime, а do_start навсегда уходил в
+    /// ранний return: задача serve уже вернулась, а слот в состоянии остался.
+    pub alive: Arc<AtomicBool>,
     pub started_at: std::time::Instant,
     pub port: u16,
     pub requests: Arc<AtomicU64>,
@@ -50,6 +57,14 @@ pub struct ServerStatus {
     pub devices: Vec<gateway::DeviceBrief>,
 }
 
+/// Жив ли слот: листенер поднялся и обслуживает порт.
+/// is_finished() у tauri::async_runtime::JoinHandle отсутствует (это enum-обёртка),
+/// поэтому полагаемся на alive: serve_http гасит alive=false и при ошибке бинда,
+/// и после возврата из axum::serve - то есть ровно когда листенер перестал работать.
+fn slot_alive(s: &RunningServer) -> bool {
+    s.alive.load(Ordering::SeqCst)
+}
+
 fn status_of(state: &ServerState) -> ServerStatus {
     // ВНИМАНИЕ: этот вызов происходит на каждый поллинг дашборда (раз в 2с).
     // Здесь нельзя ни читать конфиг, ни спавнить tailscale.exe - load_or_init()
@@ -60,19 +75,23 @@ fn status_of(state: &ServerState) -> ServerStatus {
     let tls_error = crate::server::tls_runtime_error();
     match state.running.lock().unwrap().as_ref() {
         Some(s) => {
-            // https только если TLS запрошен И листенер реально поднялся
-            let tls_serving = if s.gw.cfg.tls_enabled && tls_error.is_none() {
-                "https"
+            let alive = slot_alive(s);
+            // https только если TLS запрошен И листенер реально поднялся;
+            // у мёртвого узла утверждать схему нечего (H7)
+            let tls_serving = if !alive {
+                None
+            } else if s.gw.cfg.tls_enabled && tls_error.is_none() {
+                Some("https".to_string())
             } else {
-                "http"
+                Some("http".to_string())
             };
             ServerStatus {
-                running: true,
+                running: alive,
                 port: s.port,
-                uptime_seconds: s.started_at.elapsed().as_secs(),
+                uptime_seconds: if alive { s.started_at.elapsed().as_secs() } else { 0 },
                 requests: s.requests.load(Ordering::Relaxed),
                 tls_sha256,
-                tls_serving: Some(tls_serving.to_string()),
+                tls_serving,
                 tls_error,
                 devices: s.gw.device_briefs(),
             }
@@ -92,20 +111,37 @@ fn status_of(state: &ServerState) -> ServerStatus {
 }
 
 fn is_running(state: &ServerState) -> bool {
-    state.running.lock().unwrap().is_some()
+    // H7: слот есть - ещё не значит узел работает. Мёртвый слот (ошибка бинда)
+    // больше не блокирует do_start ранним return'ом навсегда.
+    state
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(slot_alive)
+        .unwrap_or(false)
 }
 
-fn stop_inner(state: &ServerState) {
+/// Забирает слот из состояния и гасит узел. Возвращает задачу serve (и фоновые),
+/// если что-то было, - вызывающий может дождаться их реального завершения.
+fn take_and_signal(state: &ServerState) -> Option<RunningServer> {
     let taken = {
         let mut g = state.running.lock().unwrap();
         g.take()
     };
-    if let Some(s) = taken {
-        let _ = s.shutdown.try_send(());
+    taken.inspect(|s| {
+        // L1: watch::Sender::send - мультикаст, ошибки «канал полон» не
+        // существует. Err бывает только когда все приёмники уже сброшены
+        // (задача serve завершилась сама) - останавливать тогда нечего.
+        let _ = s.shutdown.send(true);
+        s.alive.store(false, Ordering::SeqCst);
+    })
+}
+
+fn stop_inner(state: &ServerState) {
+    if let Some(s) = take_and_signal(state) {
         // Give the axum task a short window for graceful drain (in-flight
         // requests finish, port releases), then hard-abort whatever is left.
-        // 300ms < restart_if_running's 400ms rebind pause, so the port is
-        // always free by the time do_start binds again.
         let handle = s.handle;
         let bg = s.bg;
         tauri::async_runtime::spawn(async move {
@@ -116,6 +152,36 @@ fn stop_inner(state: &ServerState) {
             }
         });
     }
+}
+
+/// L2: остановка с реальным ожиданием вместо `thread::sleep(400ms)`.
+///
+/// Синхронно `await` здесь нельзя (команда tauri уже крутится на блокирующем
+/// потоке того же рантайма - `block_on` бы запаниковал), поэтому ждём опросом
+/// `is_finished()`: idle-узел освобождает порт за десятки миллисекунд, а не за
+/// фиксированные 400. Если graceful drain не уложился в окно (типичный случай -
+/// висящий 20-секундный long-poll /api/events), добиваем abort'ом и ждём уже
+/// фактического завершения задачи, чтобы do_start не биндился в занятый порт.
+fn stop_and_wait(state: &ServerState, graceful: std::time::Duration) {
+    let Some(s) = take_and_signal(state) else { return };
+    let alive = s.alive.clone();
+    let handle = s.handle;
+    let bg = s.bg;
+    // Ждём, пока serve сама погасит alive (graceful drain). is_finished() у tauri
+    // JoinHandle нет, поэтому опрашиваем alive: serve_http ставит false после
+    // возврата из axum::serve. idle-узел освобождает порт за десятки миллисекунд.
+    let deadline = std::time::Instant::now() + graceful;
+    while alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    handle.abort();
+    for h in bg {
+        h.abort();
+    }
+    // abort роняет задачу, не выполняя alive=false, поэтому опрашивать alive
+    // дальше бесполезно - даём фиксированное окно на снятие с воркера и
+    // освобождение порта, чтобы do_start не биндился в занятый.
+    std::thread::sleep(std::time::Duration::from_millis(150));
 }
 
 /// rustls 0.23 needs exactly one process-level CryptoProvider. Our dependency
@@ -144,15 +210,22 @@ fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
     let started_at = std::time::Instant::now();
     let requests = Arc::new(AtomicU64::new(0));
     let (gw, bg) = gateway::Gateway::new(cfg, requests.clone());
-    let (tx, rx) = tokio::sync::mpsc::channel::<()>(1);
-    let handle = tauri::async_runtime::spawn(server::serve(gw.clone(), rx));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    // H7: стартуем с alive=true; serve сам сбросит флаг, если листенер не
+    // забиндится (порт занят, неверный listen_host).
+    let alive = Arc::new(AtomicBool::new(true));
+    let handle = tauri::async_runtime::spawn(server::serve(gw.clone(), rx, alive.clone()));
 
     {
         let mut g = state.running.lock().unwrap();
+        // Если в слоте лежит мёртвый узел (is_running теперь смотрит на alive),
+        // перезаписываем его: drop старого RunningServer роняет watch::Sender,
+        // и его serve/tasks видят «отправитель сброшен» и завершаются.
         *g = Some(RunningServer {
             handle,
             bg,
             shutdown: tx,
+            alive,
             started_at,
             port,
             requests,
@@ -164,10 +237,15 @@ fn do_start(state: &ServerState) -> Result<ServerStatus, String> {
 
 /// Restart the node in place so a config change (e.g. new device) takes effect.
 fn restart_if_running(state: &ServerState) {
-    if is_running(state) {
-        stop_inner(state);
-        // даём порту выдохнуться перед повторным биндом
-        std::thread::sleep(std::time::Duration::from_millis(400));
+    // Проверяем наличие слота, а не is_running: узел мог умереть на бинде
+    // (alive=false), и тогда рестарт - единственное, что его поднимет.
+    // stop_and_wait на мёртвом слоте отрабатывает мгновенно (задача уже
+    // is_finished), так что фиксированной паузы больше нет.
+    let has_slot = state.running.lock().unwrap().is_some();
+    if has_slot {
+        // L2: ждём фактического освобождения порта, а не фиксированные 400мс.
+        // Окно graceful drain то же, что было (300мс) - дальше abort.
+        stop_and_wait(state, std::time::Duration::from_millis(300));
         let _ = do_start(state);
     }
 }

@@ -300,9 +300,51 @@ pub fn new_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Сколько живёт закэшированный IP tailnet. Адрес перевыпускается редко
+/// (минуты/часы), а вот load_or_init() дёргается на каждый push-dispatch и на
+/// каждый HTTP-запрос телефона - поэтому детект не должен быть чаще TTL.
+const TS_IP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+static TS_IP_CACHE: std::sync::Mutex<Option<(std::time::Instant, String)>> =
+    std::sync::Mutex::new(None);
+
+fn ts_ip_cache_get() -> Option<String> {
+    let g = TS_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match g.as_ref() {
+        Some((at, ip)) if at.elapsed() < TS_IP_TTL => Some(ip.clone()),
+        _ => None,
+    }
+}
+
+fn ts_ip_cache_put(ip: &str) {
+    *TS_IP_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((std::time::Instant::now(), ip.to_string()));
+}
+
+/// Всегда свежий IP: дёргает CLI и обновляет кеш. Только для редких явных
+/// запросов - например heal_tailnet() сразу после rebind/restun, где
+/// закэшированное значение заведомо устарело.
 pub fn tailscale_ip() -> String {
+    let ip = detect_tailscale_ip();
+    ts_ip_cache_put(&ip);
+    ip
+}
+
+/// IP из кеша; детект - лишь когда кеш пуст или протух (не чаще раза в TTL на
+/// процесс). Это путь load_or_init()/generate(): QR и SAN сертификата по-прежнему
+/// видят актуальный адрес, но внешний процесс больше не запускается на каждое
+/// перечитывание конфига - а оно происходит под CONFIG_LOCK в push.rs, то есть
+/// блокирующий spawn tailscale.exe вешал глобальный мьютекс на tokio-worker'е.
+pub fn cached_tailscale_ip() -> String {
+    if let Some(ip) = ts_ip_cache_get() {
+        return ip;
+    }
+    tailscale_ip()
+}
+
+fn detect_tailscale_ip() -> String {
     // 1) авторитетный источник - сам tailscale CLI (hidden: консольное окно не
-    // должно мелькать, этот путь вызывается при каждом load_or_init)
+    // должно мелькать)
     for exe in [
         r"C:\Program Files\Tailscale\tailscale.exe".to_string(),
         "tailscale.exe".to_string(),
@@ -351,7 +393,7 @@ impl AppConfig {
             listen_host: "0.0.0.0".to_string(),
             listen_port: 8460,
             staging_path: staging.to_string_lossy().to_string(),
-            tailscale_ip: tailscale_ip(),
+            tailscale_ip: cached_tailscale_ip(),
             connector_id: "dsh-phone".to_string(),
             created_at_unix: now(),
             bridge_endpoint_path: default_bridge_endpoint(),
@@ -379,7 +421,10 @@ impl AppConfig {
                 match serde_json::from_str::<AppConfig>(&s) {
                     Ok(mut c) => {
                         c.config_path = cp.to_string_lossy().to_string();
-                        c.tailscale_ip = tailscale_ip();
+                        // из кеша, а не детектом: load_or_init() вызывается под
+                        // CONFIG_LOCK (push.rs) и на каждый HTTP-запрос телефона,
+                        // спавнить tailscale.exe там нельзя
+                        c.tailscale_ip = cached_tailscale_ip();
                         if c.vapid_keys.is_none() {
                             c.vapid_keys = Some(crate::push::VapidKeys::generate());
                         }
@@ -405,7 +450,7 @@ impl AppConfig {
                         backup_config(&cp);
                         if let Some(mut c) = salvage(&s) {
                             c.config_path = cp.to_string_lossy().to_string();
-                            c.tailscale_ip = tailscale_ip();
+                            c.tailscale_ip = cached_tailscale_ip();
                             if c.vapid_keys.is_none() {
                                 c.vapid_keys = Some(crate::push::VapidKeys::generate());
                             }

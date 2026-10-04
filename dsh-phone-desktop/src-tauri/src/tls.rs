@@ -54,7 +54,14 @@ pub async fn rustls_config(
         .unwrap_or(true);
     let chain_incomplete = !cp.exists() || !kp.exists() || !ca_cert_path().exists();
     if chain_incomplete || stale {
-        ensure_chain(cfg, ip)?;
+        // Выпуск цепочки - fs::write, генерация двух ключевых пар и
+        // magicdns_name(), который блокирующе спавнит `tailscale status --json`.
+        // rustls_config() async (старт узла), поэтому уносим это на blocking-пул
+        // вместо того чтобы держать tokio-worker.
+        let owned = cfg.clone();
+        tokio::task::spawn_blocking(move || ensure_chain(&owned, ip))
+            .await
+            .map_err(|e| e.to_string())??;
     }
     axum_server::tls_rustls::RustlsConfig::from_pem_file(cp, kp)
         .await
@@ -144,12 +151,34 @@ fn ensure_chain(cfg: &AppConfig, ip: IpAddr) -> Result<(), String> {
     Ok(())
 }
 
+/// Кеш отпечатка. cert_sha256() зовётся из status_of() (lib.rs) на каждый
+/// поллинг дашборда - раз в 2с - и из серверного /info на каждый запрос
+/// телефона, а внутри fs::read + разбор PEM-цепочки + SHA-256. Файл меняется
+/// только при (пере)выпуске цепочки, поэтому ключ кеша - mtime и размер.
+type ShaCacheEntry = ((std::time::SystemTime, u64), Option<String>);
+static SHA_CACHE: std::sync::Mutex<Option<ShaCacheEntry>> = std::sync::Mutex::new(None);
+
 /// SHA-256 of the served leaf certificate DER, for pinning on the device.
 pub fn cert_sha256() -> Option<String> {
     let cp = cert_path();
-    if !cp.exists() {
-        return None;
+    // файла нет -> и отпечатка нет; кеш не трогаем, следующий вызов после
+    // выпуска сертификата увидит новый mtime
+    let meta = std::fs::metadata(&cp).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+    {
+        let g = SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, sha)) = g.as_ref() {
+            if *cached == stamp {
+                return sha.clone();
+            }
+        }
     }
+    let sha = compute_cert_sha256(&cp);
+    *SHA_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((stamp, sha.clone()));
+    sha
+}
+
+fn compute_cert_sha256(cp: &std::path::Path) -> Option<String> {
     let bytes = std::fs::read(cp).ok()?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut &bytes[..])
         .collect::<Result<_, _>>()

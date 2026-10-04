@@ -10,7 +10,29 @@ let nodeFor = new Map();     // key -> DOM node
 let knownStatus = "";
 let since = 0;
 let pollTimer = null;
+let pollOn = false;            // A1: единственный признак живого цикла поллинга
+let pollAbort = null;          // A2: отмена in-flight long-poll
 let refreshTimer = null;
+let refreshInFlight = false;   // A2: только один refreshActiveChat за раз
+let refreshQueued = false;
+let chatEpoch = 0;             // A3: «поколение» чата; каждый .then сверяет его
+let chatAbort = null;          // A2/A3: отмена запросов ушедшего чата
+let approvalInFlight = false;  // A8
+let approvalQueued = false;
+let lastApprovalAt = 0;
+let authInFlight = false;      // A1: повторный тап «предъявить ключ»
+let orderedCache = null;       // A5: кэш отсортированного списка айтемов
+let lastUserSeq = -1;          // A5: инкрементальный lastUserText
+let sessionsSig = "";          // A9: сигнатура списка сессий
+let pageHiddenAt = 0;          // A14
+let lastAuthToken = "";        // A11: токен, для которого актуальны since/sessions
+const notifiedNotices = new Set();  // A8: дедуп уведомлений по noticeId
+const notifiedTurns = new Map();    // A8: дедуп уведомлений по sessionId
+const MAX_ITEMS = 1500;             // A5: потолок истории в памяти и в DOM
+const FETCH_TIMEOUT_MS = 20000;     // A2
+const EVENTS_TIMEOUT_MS = 120000;   // A2: long-poll узел держит дольше обычного RPC
+const APPROVAL_MIN_MS = 700;        // A8
+const HIST_SESSIONS_KEEP = 40;      // A10: LRU-потолок кэша истории в localStorage
 let lastError = "";
 let models = [];
 let permissions = [];
@@ -160,20 +182,51 @@ function show(view) {
   $("model-btn").classList.toggle("hidden", view !== "view-chat");
 }
 
-function api(method, params = {}) {
-  return fetch("/api/rpc", {
+// ---------- A2: общий механизм отмены и таймаутов ----------
+// Возвращает AbortController со встроенным таймаутом; dispose() снимает таймер
+// и отписывается от родительского сигнала (иначе контроллеры копятся).
+function newAbort(parent, ms) {
+  const ctl = new AbortController();
+  let timer = null;
+  let unlink = null;
+  const dispose = () => {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    if (unlink) { try { unlink(); } catch (_) {} unlink = null; }
+  };
+  ctl.dispose = dispose;
+  if (ms) timer = setTimeout(() => { try { ctl.abort(); } catch (_) {} }, ms);
+  if (parent) {
+    const onParentAbort = () => { try { ctl.abort(); } catch (_) {} };
+    if (parent.signal.aborted) { try { ctl.abort(); } catch (_) {} }
+    else parent.signal.addEventListener("abort", onParentAbort, { once: true });
+    unlink = () => { try { parent.signal.removeEventListener("abort", onParentAbort); } catch (_) {} };
+  }
+  return ctl;
+}
+
+function isAbort(e) { return !!(e && e.name === "AbortError"); }
+
+function jsonPost(url, body, opts = {}) {
+  const ctl = newAbort(opts.parent || null, opts.timeout || FETCH_TIMEOUT_MS);
+  const dispose = () => { try { ctl.dispose(); } catch (_) {} };
+  return fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, method, params }),
-  }).then((r) => r.json());
+    body: JSON.stringify(body),
+    signal: ctl.signal,
+  }).then((r) => {
+    // A4: 502/HTML-страница ошибки больше не падает молча внутри r.json()
+    if (!r.ok) throw new Error("http " + r.status);
+    return r.json();
+  }).then((j) => { dispose(); return j; }, (e) => { dispose(); throw e; });
+}
+
+function api(method, params = {}, opts = {}) {
+  return jsonPost("/api/rpc", { token, method, params }, opts);
 }
 
 function watch(sid, off) {
-  return fetch("/api/watch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, sessionId: sid, unwatch: !!off }),
-  }).then((r) => r.json());
+  return jsonPost("/api/watch", { token, sessionId: sid, unwatch: !!off }, {});
 }
 
 // ---------- auth ----------
@@ -1656,31 +1709,69 @@ function processEvent(ev) {
 }
 
 async function pollLoop() {
+  // A1: флаг жизни проверяется и до запроса, и после — вторая цепочка не выживает
+  if (!pollOn) return;
   let got = 0, failed = false;
+  const ctl = newAbort(null, EVENTS_TIMEOUT_MS);
+  pollAbort = ctl;
   try {
     const r = await fetch(`/api/events?since=${since}&had=1`, {
       headers: { "X-Dsh-Token": token },
-    }).then((x) => x.json());
-    since = r.ts;
-    const evs = r.events || [];
+      signal: ctl.signal,
+    }).then((x) => {
+      if (!x.ok) throw new Error("http " + x.status);
+      return x.json();
+    });
+    if (!pollOn) return;
+    // A1: курсор сдвигаем только на своём ответе и только числом
+    if (r && typeof r.ts === "number") since = r.ts;
+    const evs = (r && r.events) || [];
     evs.forEach(processEvent);
     got = evs.length;
     lastError = "";
   } catch (e) {
+    try { ctl.dispose(); } catch (_) {}
+    if (pollAbort === ctl) pollAbort = null;
+    // отмена (pagehide/stopPolling/таймаут) — это не сбой и не повод продолжать
+    if (!pollOn || isAbort(e)) return;
     lastError = "события: " + e.message;
     failed = true;
   }
+  try { ctl.dispose(); } catch (_) {}
+  if (pollAbort === ctl) pollAbort = null;
+  if (!pollOn) return;
   if (activeSession) status(bridgeOn ? (isWorking(knownStatus) ? "агент работает…" : (knownStatus === "waiting_approval" ? "ждёт ответа…" : (knownStatus && knownStatus !== "idle" ? knownStatus : "чат"))) : "мост отключён" + (lastError ? " · " + lastError : ""));
-  const delay = failed ? 2500 : (got ? 60 : 900);
+  // A14: в скрытой вкладке будим узел и радио заметно реже
+  const floor = document.hidden ? (failed ? 15000 : 30000) : 0;
+  const delay = Math.max(floor, failed ? 2500 : (got ? 60 : 900));
   pollTimer = setTimeout(pollLoop, delay);
 }
 
-function startPolling() { if (!pollTimer) pollLoop(); }
+// A1: единственная точка входа. Прежний guard смотрел на pollTimer, а он
+// присваивается только ПОСЛЕ await — второй тап запускал вторую вечную цепочку.
+function startPolling() {
+  if (pollOn) return;
+  pollOn = true;
+  pollTimer = null;
+  pollLoop();
+}
+
+function stopPolling() {
+  pollOn = false;
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (pollAbort) {
+    try { pollAbort.abort(); } catch (_) {}
+    try { pollAbort.dispose(); } catch (_) {}
+    pollAbort = null;
+  }
+}
 
 function scheduleRefresh() {
   if (refreshTimer) return;
   const busy = activeSession && (isWorking(knownStatus) || knownStatus === "waiting_approval" || knownStatus === "asking");
-  const delay = busy ? 2500 : 7000;
+  // A14: скрытая вкладка — редкий режим
+  const base = busy ? 2500 : 7000;
+  const delay = document.hidden ? Math.max(base, 30000) : base;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
     try {
@@ -1694,20 +1785,39 @@ function scheduleRefresh() {
 
 function startRefreshTimer() { scheduleRefresh(); }
 
-function refreshActiveChat() {
-  if (!activeSession) return;
-  api("session.getState", { sessionId: activeSession }).then((rs) => {
-    if (rs.ok && rs.result) applyState(rs.result);
-  }).catch(() => {});
-  api("session.getSnapshot", { sessionId: activeSession, limit: 200 }).then((r) => {
-    if (r.ok && r.result && r.result.items) mergeInto(r.result.items, true);
-  }).catch(() => {});
+// A2/A3: sid и эпоха фиксируются на входе, ответы чужого чата отбрасываются;
+// in-flight guard не даёт запросу из 4 разных мест наслаиваться лавиной.
+function refreshActiveChat(sidArg, epArg) {
+  const sid = sidArg || activeSession;
+  if (!sid) return;
+  const ep = (epArg === undefined || epArg === null) ? chatEpoch : epArg;
+  if (ep !== chatEpoch || sid !== activeSession) return;
+  if (refreshInFlight) { refreshQueued = true; return; }
+  refreshInFlight = true;
+  const parent = chatAbort;
+  const opts = { parent: parent };
+  const stale = () => ep !== chatEpoch || sid !== activeSession;
+  const finish = () => {
+    refreshInFlight = false;
+    if (refreshQueued) { refreshQueued = false; refreshActiveChat(sid, ep); }
+  };
+  api("session.getState", { sessionId: sid }, opts).then((rs) => {
+    if (!stale() && rs && rs.ok && rs.result) applyState(rs.result, sid);
+  }).catch(() => {}).then(() => {
+    if (stale()) { finish(); return null; }
+    return api("session.getSnapshot", { sessionId: sid, limit: 200 }, opts).then((r) => {
+      if (!stale() && r && r.ok && r.result && r.result.items) mergeInto(r.result.items, true);
+    }).catch(() => {}).then(finish, finish);
+  }, finish);
 }
 
 function refreshSessions() {
   api("session.list", { limit: 1000 }).then((r) => {
-    if (r.ok) { sessions = r.result.sessions || []; renderSessions(); saveSessionsCache(sessions); }
-    else { lastError = "список сессий: " + (r.error || "?"); status(lastError); }
+    if (r && r.ok) {
+      sessions = (r.result && r.result.sessions) || [];
+      renderSessions();
+      saveSessionsCache(sessions);
+    } else { lastError = "список сессий: " + ((r && r.error) || "?"); status(lastError); }
   }).catch((e) => { lastError = "список сессий: " + e.message; status(lastError); });
 }
 

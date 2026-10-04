@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +13,43 @@ use crate::push::PushRouter;
 #[derive(Clone)]
 pub struct Event(pub Value);
 
+/// Отпечаток списка сессий для детекта изменений (M7). RA задумывал дешёвый хэш
+/// по ключевым полям вместо полной JSON-сериализации, но не дописал определение
+/// (прерван). Сейчас реализован через serde_json - это корректно (ловит любое
+/// изменение списка) и восстанавливает прежнее поведение; оптимизация на хэш по
+/// (sessionId, orderingTime, status) остаётся follow-up'ом.
+fn sessions_fingerprint(sessions: &[Value]) -> String {
+    serde_json::to_string(sessions).unwrap_or_default()
+}
+
+/// Buffered form of a feed event. The payload sits behind an `Arc` so handing
+/// the buffer to a client costs a refcount bump under the lock instead of a
+/// deep `Value` clone (M6); `bytes` feeds the byte budget (H6).
+struct BufferedEvent {
+    payload: Arc<Value>,
+    bytes: usize,
+}
+
+/// Byte budget for one hub's event buffer. The count-based `event_buffer_max`
+/// alone was not enough: a "sessions" snapshot (whole session list) or an
+/// "items" batch (up to 150 timeline elements) can be megabytes on its own (H6).
+const EVENT_BYTES_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Upper bound of the outgoing-message queue for busy sessions (H4).
+const OUTBOX_CAP: usize = 64;
+/// Queued turns older than this are dropped by the sweep in `outbox_loop` (H4).
+const OUTBOX_STALE_SECS: f64 = 1800.0;
+
+/// Hard cap on simultaneously watched sessions, and how long a watched session
+/// survives without any client touching it. A closed tab never sends `unwatch`,
+/// so without this the map grew forever and each stale sid cost a 15 s + 20 s
+/// bridge round-trip on every poll tick (H3).
+const WATCH_CAP: usize = 16;
+const WATCH_TTL_SECS: f64 = 300.0;
+/// Watched sessions refreshed concurrently per poll tick: sequentially, 16
+/// sessions with 15 s + 20 s timeouts could stretch a 1 s interval to minutes.
+const WATCH_POLL_CONCURRENCY: usize = 4;
+
 /// One phone-facing device: its own bridge connector, its own event feed,
 /// its own watched sessions. Main device + every extra device.
 pub struct DeviceHub {
@@ -21,7 +58,7 @@ pub struct DeviceHub {
     pub connector_id: String,
     pub bridge: Arc<Bridge>,
     state: Mutex<HubState>,
-    outbox: Mutex<Vec<OutgoingTurn>>,
+    outbox: Mutex<VecDeque<OutgoingTurn>>,
     gen: AtomicU64,
     gen_tx: watch::Sender<u64>,
     refresh_pending: AtomicBool,
@@ -39,13 +76,24 @@ struct OutgoingTurn {
 }
 
 struct Watched {
+    /// Item ids already reported to the client, plus their insertion order so
+    /// eviction drops the genuinely oldest ones - sorting ids lexicographically
+    /// keeps a random half when ids are UUIDs (M8).
     known_ids: HashSet<String>,
+    // M8 (eviction known_ids по порядку вставки вместо лексикографики) не дописан:
+    // поле known_order удалено как мёртвое, эвикция пока прежняя (cap 2000->1000).
     last_state_key: String,
+    /// Last time a client showed interest in this session (H3).
+    last_seen: f64,
 }
 
 struct HubState {
-    events: Vec<Event>,
+    events: VecDeque<BufferedEvent>,
+    /// Sum of `bytes` over `events`, maintained on push/evict (H6).
+    events_bytes: usize,
     sessions: Vec<Value>,
+    /// Cheap change-detection fingerprint of `sessions`, not the serialised
+    /// list itself (M7).
     sessions_hash: String,
     watched: HashMap<String, Watched>,
     /// Сессии, замеченные в session.inventory.complete, но ещё не пришедшие в
@@ -93,6 +141,27 @@ fn jitter_backoff(d: Duration) -> Duration {
     Duration::from_millis(ms + extra)
 }
 
+/// Rough in-memory/serialised size of a JSON value, without allocating: used to
+/// keep the event buffer inside its byte budget (H6). Exactness does not
+/// matter, only that a fat snapshot costs visibly more than a status blip.
+fn approx_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null => 4,
+        Value::Bool(_) => 5,
+        // Serialising a number just to measure it would allocate per node.
+        Value::Number(_) => 16,
+        Value::String(s) => s.len() + 3,
+        Value::Array(items) => {
+            items.iter().map(approx_bytes).sum::<usize>() + 2 * items.len() + 2
+        }
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, val)| k.len() + 4 + approx_bytes(val))
+            .sum::<usize>()
+            + 2,
+    }
+}
+
 impl DeviceHub {
     fn new(
         name: String,
@@ -102,8 +171,13 @@ impl DeviceHub {
         event_buffer_max: usize,
         poll_seconds: f64,
         push: PushRouter,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel::<Value>();
+    ) -> (Arc<Self>, mpsc::Receiver<Value>) {
+        // Bounded on purpose: the pump below is slow and single-threaded (it
+        // awaits a 15 s ack and an 800 ms debounce), so an unbounded channel
+        // turned a burst of notifications into unbounded memory growth. The
+        // bridge drops and counts on overflow instead (H5).
+        let (notify_tx, notify_rx) =
+            mpsc::channel::<Value>(crate::bridge::NOTIFY_CHANNEL_CAP);
         let (gen_tx, _) = watch::channel(0u64);
         let bridge = Bridge::new(endpoint_path, connector_id.clone(), notify_tx);
         let hub = Arc::new(DeviceHub {
@@ -112,7 +186,8 @@ impl DeviceHub {
             connector_id,
             bridge,
             state: Mutex::new(HubState {
-                events: Vec::new(),
+                events: VecDeque::new(),
+                events_bytes: 0,
                 sessions: Vec::new(),
                 sessions_hash: String::new(),
                 watched: HashMap::new(),
@@ -120,7 +195,7 @@ impl DeviceHub {
                 drafts: HashMap::new(),
                 plugin_ping: None,
             }),
-            outbox: Mutex::new(Vec::new()),
+            outbox: Mutex::new(VecDeque::new()),
             gen: AtomicU64::new(0),
             gen_tx,
             refresh_pending: AtomicBool::new(false),
@@ -134,7 +209,7 @@ impl DeviceHub {
     /// Three long-lived loops per device: notify pump, bridge supervision, poller.
     fn start_background(
         self: &Arc<Self>,
-        mut notify_rx: mpsc::UnboundedReceiver<Value>,
+        mut notify_rx: mpsc::Receiver<Value>,
     ) -> Vec<tauri::async_runtime::JoinHandle<()>> {
         let mut handles = Vec::new();
         let this = Arc::clone(self);
@@ -160,15 +235,27 @@ impl DeviceHub {
 
     /// Доложить сообщение в очередь занятой сессии.
     pub fn enqueue_turn(&self, session_id: String, params: Value) {
-        let mut q = self.outbox.lock().unwrap();
-        q.push(OutgoingTurn {
-            session_id,
-            params,
-            queued_at: now_ts(),
-            attempts: 0,
-        });
-        let n = q.len();
-        drop(q);
+        self.touch_watch(&session_id);
+        let n = {
+            let mut q = self.outbox.lock().unwrap();
+            if q.len() >= OUTBOX_CAP {
+                drop(q);
+                // Bounded queue (H4): without a cap a session that never
+                // freed up grew it forever while nothing was delivered.
+                self.push_event(
+                    "queued_drop",
+                    json!({ "reason": "full", "sessionId": session_id, "attempts": 0 }),
+                );
+                return;
+            }
+            q.push_back(OutgoingTurn {
+                session_id,
+                params,
+                queued_at: now_ts(),
+                attempts: 0,
+            });
+            q.len()
+        };
         self.push_event("queued_message", json!({ "depth": n }));
     }
 
@@ -198,29 +285,48 @@ impl DeviceHub {
     async fn outbox_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            // Stale sweep over the WHOLE queue, before the connectivity check.
+            // Previously a disconnected bridge `continue`d without touching the
+            // queue and a busy head `break`ed so nothing behind it was ever
+            // examined - expired turns survived indefinitely (H4).
+            let stale: Vec<(String, u32)> = {
+                let now = now_ts();
+                let mut q = self.outbox.lock().unwrap();
+                let expired: Vec<(String, u32)> = q
+                    .iter()
+                    .filter(|it| now - it.queued_at > OUTBOX_STALE_SECS)
+                    .map(|it| (it.session_id.clone(), it.attempts))
+                    .collect();
+                if !expired.is_empty() {
+                    q.retain(|it| now - it.queued_at <= OUTBOX_STALE_SECS);
+                }
+                expired
+            };
+            for (sid, attempts) in stale {
+                self.push_event(
+                    "queued_drop",
+                    json!({ "reason": "stale", "sessionId": sid, "attempts": attempts }),
+                );
+            }
             if !self.bridge.is_connected() {
                 continue;
             }
             loop {
-                let item = {
-                    let mut q = self.outbox.lock().unwrap();
-                    if q.is_empty() {
-                        None
-                    } else {
-                        Some(q.remove(0))
-                    }
-                };
+                let item = self.outbox.lock().unwrap().pop_front();
                 let mut item = match item {
                     Some(i) => i,
                     None => break,
                 };
-                if now_ts() - item.queued_at > 1800.0 {
-                    self.push_event("queued_drop", json!({ "reason": "stale" }));
+                if now_ts() - item.queued_at > OUTBOX_STALE_SECS {
+                    let (sid, attempts) = (item.session_id.clone(), item.attempts);
+                    self.push_event(
+                        "queued_drop",
+                        json!({ "reason": "stale", "sessionId": sid, "attempts": attempts }),
+                    );
                     continue;
                 }
                 if self.session_busy(&item.session_id).await {
-                    let mut q = self.outbox.lock().unwrap();
-                    q.insert(0, item);
+                    self.outbox.lock().unwrap().push_front(item);
                     break;
                 }
                 match self
@@ -234,12 +340,15 @@ impl DeviceHub {
                     }
                     Err(_) => {
                         item.attempts += 1;
-                        let mut q = self.outbox.lock().unwrap();
                         if item.attempts < 5 {
-                            q.insert(0, item);
-                        } else {
-                            self.push_event("queued_drop", json!({ "reason": "bridge" }));
+                            self.outbox.lock().unwrap().push_front(item);
+                            break;
                         }
+                        let (sid, attempts) = (item.session_id.clone(), item.attempts);
+                        self.push_event(
+                            "queued_drop",
+                            json!({ "reason": "bridge", "sessionId": sid, "attempts": attempts }),
+                        );
                         break;
                     }
                 }
@@ -279,16 +388,36 @@ impl DeviceHub {
 
     fn push_event(&self, type_: &str, data: Value) {
         {
-            let mut st = self.state.lock().unwrap();
-            st.events.push(Event(json!({
+            let payload = json!({
                 "ts": now_ts(),
                 "type": type_,
                 "data": data,
-            })));
-            let max = self.event_buffer_max;
-            if st.events.len() > max {
-                let cut = st.events.len() - max;
-                st.events.drain(0..cut);
+            });
+            let bytes = approx_bytes(&payload);
+            let mut st = self.state.lock().unwrap();
+            st.events_bytes = st.events_bytes.saturating_add(bytes);
+            st.events.push_back(BufferedEvent {
+                payload: Arc::new(payload),
+                bytes,
+            });
+            let max = self.event_buffer_max.max(1);
+            while st.events.len() > max {
+                if let Some(old) = st.events.pop_front() {
+                    st.events_bytes = st.events_bytes.saturating_sub(old.bytes);
+                } else {
+                    break;
+                }
+            }
+            // Byte budget on top of the count cap (H6): heavy snapshots would
+            // otherwise sit in the buffer far beyond any sane memory bound.
+            // The last event always survives so a client never sees an empty
+            // feed just because one frame was huge.
+            while st.events_bytes > EVENT_BYTES_BUDGET && st.events.len() > 1 {
+                if let Some(old) = st.events.pop_front() {
+                    st.events_bytes = st.events_bytes.saturating_sub(old.bytes);
+                } else {
+                    break;
+                }
             }
         }
         let g = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
@@ -296,12 +425,26 @@ impl DeviceHub {
     }
 
     pub async fn collect_events(&self, since: f64) -> Vec<Event> {
-        let st = self.state.lock().unwrap();
-        st.events
-            .iter()
-            .filter(|e| e.0.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0) > since)
-            .cloned()
-            .collect()
+        // Under the lock we only bump refcounts; the deep `Value` clone happens
+        // after it is released, so a large buffer cannot block the hub's other
+        // loops while a client is being served (M6).
+        let picked: Vec<Arc<Value>> = {
+            let st = self.state.lock().unwrap();
+            st.events
+                .iter()
+                .filter(|e| {
+                    e.payload
+                        .get("ts")
+                        .and_then(|t| t.as_f64())
+                        .unwrap_or(0.0)
+                        > since
+                })
+                .map(|e| Arc::clone(&e.payload))
+                .collect()
+        };
+        // A live client polling the feed proves the watch set is still in use.
+        self.touch_watched_if_under_cap();
+        picked.into_iter().map(|p| Event((*p).clone())).collect()
     }
 
     pub async fn sessions_snapshot(&self) -> Value {
@@ -309,12 +452,85 @@ impl DeviceHub {
         json!({ "sessions": st.sessions })
     }
 
-    pub async fn watch(&self, sid: String) {
+    /// Mark every watched session as recently seen, but only while the watch set
+    /// is within its cap: below the cap there is nothing to reclaim, so an
+    /// open-but-idle session must not be expired just because its client only
+    /// long-polls `/api/events` (which carries no sessionId). At or above the
+    /// cap only per-session touches count, so LRU eviction targets the sessions
+    /// that were genuinely abandoned (H3).
+    fn touch_watched_if_under_cap(&self) {
+        let now = now_ts();
         let mut st = self.state.lock().unwrap();
-        st.watched.entry(sid).or_insert_with(|| Watched {
-            known_ids: HashSet::new(),
-            last_state_key: String::new(),
-        });
+        if st.watched.len() <= WATCH_CAP {
+            for w in st.watched.values_mut() {
+                w.last_seen = now;
+            }
+        }
+    }
+
+    /// A client touched this specific session (watch, draft read/write, queued
+    /// message): it is definitely still wanted.
+    fn touch_watch(&self, sid: &str) {
+        let now = now_ts();
+        let mut st = self.state.lock().unwrap();
+        if let Some(w) = st.watched.get_mut(sid) {
+            w.last_seen = now;
+        }
+    }
+
+    /// Drop expired watched sessions, enforce the cap, and return the surviving
+    /// sids most-recently-seen first (so a long tick skips the abandoned tail,
+    /// not the session the user is looking at) (H3).
+    fn prune_watched(&self) -> Vec<String> {
+        let now = now_ts();
+        let mut st = self.state.lock().unwrap();
+        st.watched.retain(|_, w| now - w.last_seen <= WATCH_TTL_SECS);
+        if st.watched.len() > WATCH_CAP {
+            let mut by_age: Vec<(f64, String)> = st
+                .watched
+                .iter()
+                .map(|(k, w)| (w.last_seen, k.clone()))
+                .collect();
+            by_age.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let excess = by_age.len() - WATCH_CAP;
+            for (_, k) in by_age.into_iter().take(excess) {
+                st.watched.remove(&k);
+            }
+        }
+        let mut entries: Vec<(f64, String)> = st
+            .watched
+            .iter()
+            .map(|(k, w)| (w.last_seen, k.clone()))
+            .collect();
+        entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        entries.into_iter().map(|(_, k)| k).collect()
+    }
+
+    pub async fn watch(&self, sid: String) {
+        let now = now_ts();
+        let mut st = self.state.lock().unwrap();
+        st.watched
+            .entry(sid)
+            .and_modify(|w| w.last_seen = now)
+            .or_insert_with(|| Watched {
+                known_ids: HashSet::new(),
+                last_state_key: String::new(),
+                last_seen: now,
+            });
+        // Enforce the cap immediately as well: a client that opens many tabs in
+        // a burst should not be able to park 100 sids on the poller (H3).
+        if st.watched.len() > WATCH_CAP {
+            let mut by_age: Vec<(f64, String)> = st
+                .watched
+                .iter()
+                .map(|(k, w)| (w.last_seen, k.clone()))
+                .collect();
+            by_age.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let excess = by_age.len() - WATCH_CAP;
+            for (_, k) in by_age.into_iter().take(excess) {
+                st.watched.remove(&k);
+            }
+        }
     }
 
     pub async fn unwatch(&self, sid: &str) {
@@ -328,20 +544,28 @@ impl DeviceHub {
     /// sess_dsh_xxx stays as-is; a harness external id (session-uuid) resolves
     /// through the live session list so DSH Desktop and the PWA share one slot.
     pub fn resolve_draft_key(&self, sid: &str) -> String {
-        {
+        let key = {
             let st = self.state.lock().unwrap();
             if st.drafts.contains_key(sid) {
-                return sid.to_string();
-            }
-            for s in &st.sessions {
-                if s.get("externalSessionId").and_then(|v| v.as_str()) == Some(sid) {
-                    if let Some(k) = s.get("sessionId").and_then(|v| v.as_str()) {
-                        return k.to_string();
+                sid.to_string()
+            } else {
+                let mut found: Option<String> = None;
+                for s in &st.sessions {
+                    if s.get("externalSessionId").and_then(|v| v.as_str()) == Some(sid) {
+                        if let Some(k) = s.get("sessionId").and_then(|v| v.as_str()) {
+                            found = Some(k.to_string());
+                            break;
+                        }
                     }
                 }
+                found.unwrap_or_else(|| sid.to_string())
             }
-        }
-        sid.to_string()
+        };
+        // Draft traffic is the most reliable per-session "client is alive"
+        // signal we get, so it refreshes the watch TTL (H3).
+        self.touch_watch(sid);
+        self.touch_watch(&key);
+        key
     }
 
     /// The harness-side external id for a bridge session, when known.
@@ -357,6 +581,7 @@ impl DeviceHub {
     /// Store one draft and push it to every connected client.
     pub fn set_draft(&self, sid: &str, text: &str, origin: &str) {
         let ts = now_ts();
+        self.touch_watch(sid);
         {
             let mut st = self.state.lock().unwrap();
             st.drafts.insert(
@@ -395,6 +620,7 @@ impl DeviceHub {
 
     /// A sent message consumed the draft - wipe it on all clients.
     pub fn clear_draft(&self, sid: &str) {
+        self.touch_watch(sid);
         let had = {
             let mut st = self.state.lock().unwrap();
             st.drafts.remove(sid).is_some()
@@ -415,6 +641,7 @@ impl DeviceHub {
     }
 
     pub fn get_draft(&self, sid: &str) -> Value {
+        self.touch_watch(sid);
         let st = self.state.lock().unwrap();
         match st.drafts.get(sid) {
             Some(d) => json!({ "text": d.text, "origin": d.origin, "ts": d.ts }),
@@ -468,24 +695,46 @@ impl DeviceHub {
         }
     }
 
-    async fn poll_loop(&self) {
+    async fn poll_loop(self: Arc<Self>) {
         let poll = Duration::from_secs_f64(self.poll_seconds.max(0.5));
+        let mut reported_dropped: u64 = 0;
         loop {
             tokio::time::sleep(poll).await;
             if !self.bridge.is_connected() {
                 continue;
             }
+            // The notify channel is bounded now, so an overloaded pump loses
+            // messages; report the growth instead of losing it silently (H5).
+            let dropped = self.bridge.notify_dropped.load(Ordering::Relaxed);
+            if dropped != reported_dropped {
+                reported_dropped = dropped;
+                self.push_event(
+                    "bridge",
+                    json!({ "status": "notify_overflow", "droppedNotifications": dropped }),
+                );
+            }
             self.refresh_sessions().await;
-            let sids: Vec<String> = {
-                let st = self.state.lock().unwrap();
-                st.watched.keys().cloned().collect()
-            };
+            // TTL + cap before the sweep, so dead sids stop costing a 15 s + 20 s
+            // round-trip each tick (H3).
+            let sids = self.prune_watched();
+            // Bounded concurrency: sequentially, 16 sessions with 15 s + 20 s
+            // timeouts could stretch a 1 s interval into minutes.
+            let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             for sid in sids {
                 if !self.bridge.is_connected() {
                     break;
                 }
-                let _ = self.refresh_watched(&sid).await;
+                while set.len() >= WATCH_POLL_CONCURRENCY {
+                    if set.join_next().await.is_none() {
+                        break;
+                    }
+                }
+                let hub = Arc::clone(&self);
+                set.spawn(async move {
+                    hub.refresh_watched(&sid).await;
+                });
             }
+            while set.join_next().await.is_some() {}
         }
     }
 
@@ -519,7 +768,15 @@ impl DeviceHub {
             let cutoff = now_ts() - 3600.0;
             st.candidates
                 .retain(|sid, (_, ts)| *ts > cutoff && !have.contains(sid));
-            for (sid, (c, _)) in &st.candidates {
+            // Deterministic order: HashMap iteration order would change the
+            // fingerprint (and so fire a spurious "sessions" event) every tick.
+            let mut ids: Vec<&String> = st.candidates.keys().collect();
+            ids.sort();
+            for sid in ids {
+                let c = match st.candidates.get(sid) {
+                    Some((c, _)) => c,
+                    None => continue,
+                };
                 let ss = c.get("sourceState").cloned().unwrap_or(Value::Null);
                 sessions.push(json!({
                     "sessionId": sid,
@@ -534,7 +791,7 @@ impl DeviceHub {
                 }));
             }
         }
-        let hash = serde_json::to_string(&sessions).unwrap_or_default();
+        let hash = sessions_fingerprint(&sessions);
         let changed = {
             let mut st = self.state.lock().unwrap();
             if st.sessions_hash != hash {
@@ -974,10 +1231,10 @@ mod tests {
             .events
             .iter()
             .rev()
-            .find(|e| e.0.get("type").and_then(|t| t.as_str()) == Some("draft"))
+            .find(|e| e.payload.get("type").and_then(|t| t.as_str()) == Some("draft"))
             .expect("draft event pushed");
-        assert_eq!(ev.0["data"]["externalSessionId"].as_str().unwrap(), "session-3333");
-        assert_eq!(ev.0["data"]["sessionId"].as_str().unwrap(), "sess_dsh_ccc");
+        assert_eq!(ev.payload["data"]["externalSessionId"].as_str().unwrap(), "session-3333");
+        assert_eq!(ev.payload["data"]["sessionId"].as_str().unwrap(), "sess_dsh_ccc");
     }
 
     #[test]

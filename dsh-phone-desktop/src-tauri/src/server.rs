@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -148,6 +148,22 @@ async fn attachment(
         .join("objects")
         .join(&hexid[0..2])
         .join(&hexid);
+    // M5: сначала метаданные. Раньше объект читался в память целиком без
+    // проверки размера - испорченный/огромный файл в сторе означал такой же
+    // огромный буфер в tokio-worker'е на каждый запрос картинки.
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) => m,
+        Err(_) => {
+            return json_status(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "attachment not found" }))
+        }
+    };
+    let len = meta.len();
+    if len > gw.cfg.max_attachment_bytes {
+        return json_status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "ok": false, "error": "attachment too large" }),
+        );
+    }
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(_) => {
@@ -355,7 +371,11 @@ async fn events(
     let since: f64 = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let had = q.contains_key("had");
     let mut rx = hub.gen_rx();
-    let _ = rx.borrow();
+    // L6: поколение фиксируется ДО чтения буфера (borrow_and_update, а не
+    // borrow, который ничего не помечает). Тогда любое событие, прилетевшее
+    // между подпиской и collect_events, разбудит rx.changed() и буфер будет
+    // перечитан - потерянная доставка превращается в лишний цикл, а не в дыру.
+    let _ = rx.borrow_and_update();
     let mut evs = hub.collect_events(since).await;
     if evs.is_empty() {
         tokio::select! {
@@ -434,6 +454,16 @@ async fn upload(State(gw): State<Arc<Gateway>>, Json(b): Json<UploadBody>) -> Re
     } else {
         b.mediaType
     };
+    // M5: проверка размера ДО декодирования. base64 раздувает данные в 4/3,
+    // поэтому предел по строке считается от max_attachment_bytes; иначе под
+    // лимит памяти попадала и строка, и уже распознанный буфер одновременно.
+    let encoded_limit = encoded_budget(gw.cfg.max_attachment_bytes);
+    if b.data.len() as u64 > encoded_limit {
+        return json_status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({ "ok": false, "error": "file size out of bounds" }),
+        );
+    }
     let raw = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b.data) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -452,10 +482,28 @@ async fn upload(State(gw): State<Arc<Gateway>>, Json(b): Json<UploadBody>) -> Re
     }
     let upload_id = crate::config::new_token();
     let file_id = format!("file_{}", crate::config::new_token());
-    let sha = sha256_hex(&raw);
-    if let Err(e) = write_staging(&gw.cfg.staging_path, &upload_id, &raw) {
-        return json_status(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": e }));
-    }
+    // L7: sha256 и std::fs::write - блокирующая работа, на tokio-worker'е она
+    // держала весь пул (десятки мегабайт на каждый аплоад). Уносим в
+    // spawn_blocking одним куском, чтобы не копировать буфер дважды.
+    let stage = gw.cfg.staging_path.clone();
+    let stage_id = upload_id.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        let sha = sha256_hex(&raw);
+        write_staging(&stage, &stage_id, &raw).map(|()| sha)
+    })
+    .await;
+    let sha = match staged {
+        Ok(Ok(sha)) => sha,
+        Ok(Err(e)) => {
+            return json_status(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": e }));
+        }
+        Err(e) => {
+            return json_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "ok": false, "error": format!("staging task failed: {e}") }),
+            );
+        }
+    };
     json_status(
         StatusCode::OK,
         json!({
@@ -470,6 +518,15 @@ async fn upload(State(gw): State<Arc<Gateway>>, Json(b): Json<UploadBody>) -> Re
             }
         }),
     )
+}
+
+/// Сколько байт base64-текста соответствует `max_attachment_bytes` (4/3 плюс
+/// запас на паддинги и переносы строк) - верхняя граница тела аплоада.
+fn encoded_budget(max_bytes: u64) -> u64 {
+    max_bytes
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(1024)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -516,7 +573,12 @@ async fn staging_cleanup_loop(gw: Arc<Gateway>, mut stop: tokio::sync::watch::Re
     let stage = gw.cfg.staging_path.clone();
     let retention = gw.cfg.staging_retention_secs;
     loop {
-        let n = cleanup_staging(&stage, retention);
+        // L7: std::fs::read_dir/metadata/remove_file - блокирующие syscalls,
+        // уносим их с tokio-worker'а (задача и так отдельная, ждать некому).
+        let stage_bg = stage.clone();
+        let n = tokio::task::spawn_blocking(move || cleanup_staging(&stage_bg, retention))
+            .await
+            .unwrap_or(0);
         if n > 0 {
             eprintln!("dsh-phone: staging purged {n} stale attachment(s)");
         }
@@ -729,9 +791,15 @@ impl Drop for ShutdownOnDrop {
     }
 }
 
-pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
-    let port = gw.cfg.listen_port;
-    let app = Router::new()
+/// Основной роутер узла. Вынесен в функцию, потому что при ошибке TLS-бинда
+/// (H7) нам нужен второй, точно такой же роутер для HTTP-fallback'а: первый
+/// уже уехал внутрь axum_server и повторно не используется.
+fn build_router(gw: &Arc<Gateway>) -> Router {
+    // M5: лимит тела считается от max_attachment_bytes (base64 = 4/3) вместо
+    // жёстких 80МБ: раньше можно было прислать 80МБ JSON при лимите в 50МБ и
+    // получить их в памяти до всякой проверки.
+    let body_limit = encoded_budget(gw.cfg.max_attachment_bytes).saturating_add(64 * 1024);
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/attachment", get(attachment))
         .route("/api/rpc", post(rpc))
@@ -743,14 +811,26 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
         .route("/api/push/unsubscribe", post(push_unsubscribe))
         .route(
             "/api/upload",
-            post(upload).layer(DefaultBodyLimit::max(80 * 1024 * 1024)),
+            post(upload).layer(DefaultBodyLimit::max(body_limit as usize)),
         )
         .route("/", get(root))
         .fallback(static_fallback)
         .layer(middleware::from_fn_with_state(gw.clone(), count_reqs))
         .layer(middleware::from_fn_with_state(gw.clone(), ip_filter))
         .layer(middleware::from_fn(cors_layer))
-        .with_state(gw.clone());
+        .with_state(gw.clone())
+}
+
+/// `stop` - watch-канал (L1): мультикаст, не имеет очереди, поэтому «сигнал не
+/// влез» и молча потерянный graceful shutdown больше невозможны. `alive` (H7)
+/// гаснет, если листенер так и не забиндился, - дашборд по нему отличает
+/// «узел работает» от «узел умер, но задача ещё висит в состоянии».
+pub async fn serve(
+    gw: Arc<Gateway>,
+    stop: tokio::sync::watch::Receiver<bool>,
+    alive: Arc<AtomicBool>,
+) {
+    let port = gw.cfg.listen_port;
 
     // Honour listen_host from the config (it was previously ignored and the
     // node always bound 0.0.0.0).
@@ -800,13 +880,16 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
 
                 let handle = axum_server::Handle::new();
                 let h2 = handle.clone();
+                // watch::Receiver клонируется дёшево, поэтому внешний сигнал
+                // остановки остаётся у нас в руках и для HTTP-fallback'а ниже.
+                let mut tls_stop = stop.clone();
                 tokio::spawn(async move {
-                    let _ = rx.recv().await;
+                    let _ = tls_stop.wait_for(|v| *v).await;
                     h2.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
                 });
                 let served = axum_server::bind_rustls(addr, config)
                     .handle(handle)
-                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .serve(build_router(&gw).into_make_service_with_connect_info::<SocketAddr>())
                     .await;
                 match served {
                     Ok(()) => set_tls_runtime(None),
@@ -814,6 +897,14 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
                         let msg = format!("TLS listener failed: {e}");
                         eprintln!("dsh-phone: {msg}");
                         set_tls_runtime(Some(msg));
+                        // H7: раньше на ошибке бинда serve просто возвращался, а
+                        // RunningServer оставался в состоянии - дашборд вечно
+                        // показывал running:true с растущим uptime, телефон не
+                        // подключался, а do_start уходил в ранний return. Теперь
+                        // асимметрии нет: TLS-конфиг не собрался И TLS-листенер
+                        // не забиндился одинаково отдают узел обычным HTTP.
+                        eprintln!("dsh-phone: falling back to plain HTTP");
+                        serve_http(build_router(&gw), addr, stop, alive).await;
                     }
                 }
             }
@@ -821,12 +912,12 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
                 let msg = e.to_string();
                 eprintln!("dsh-phone: TLS setup failed ({e}); serving plain HTTP");
                 set_tls_runtime(Some(msg));
-                serve_http(app, addr, rx).await;
+                serve_http(build_router(&gw), addr, stop, alive).await;
             }
         }
     } else {
         set_tls_runtime(None);
-        serve_http(app, addr, rx).await;
+        serve_http(build_router(&gw), addr, stop, alive).await;
     }
 }
 
@@ -891,12 +982,16 @@ async fn loopback_only(
 async fn serve_http(
     app: Router,
     addr: SocketAddr,
-    mut rx: tokio::sync::mpsc::Receiver<()>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    alive: Arc<AtomicBool>,
 ) {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("dsh-phone: bind {addr}: {e}");
+            // H7: узел не слушает - status_of/is_running должны это видеть,
+            // иначе дашборд рисует работающий узел с растущим uptime.
+            alive.store(false, Ordering::SeqCst);
             return;
         }
     };
@@ -905,9 +1000,12 @@ async fn serve_http(
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        let _ = rx.recv().await;
+        let _ = stop.wait_for(|v| *v).await;
     })
     .await;
+    // Листенер больше не обслуживает порт (shutdown или ошибка) - статус не
+    // должен показывать работающий узел, пока задача ещё висит в слоте.
+    alive.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]

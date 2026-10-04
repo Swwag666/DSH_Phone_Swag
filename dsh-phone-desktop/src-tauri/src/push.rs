@@ -298,7 +298,63 @@ fn vapid_auth_header(vapid: &VapidKeys, endpoint: &str) -> Result<String, String
 
 /// Guards load-mutate-save cycles on config.json (phone HTTP + dashboard IPC
 /// can race; notifications are rare, so a coarse file lock is plenty).
+/// Правило: под замком только работа с файлом и никогда `.await` - иначе одна
+/// медленная отправка держала бы весь роутер (и HTTP-путь подписки в придачу).
 static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Сколько доставок может идти одновременно. dispatch() зовётся на каждый
+/// turnEnded/waiting_approval, и без ограничителя всплеск событий спавнил
+/// неограниченное число задач, каждая со своим reqwest-клиентом и своим
+/// перечитыванием config.json под CONFIG_LOCK.
+const MAX_INFLIGHT_DISPATCH: usize = 4;
+
+fn dispatch_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_DISPATCH)))
+}
+
+/// Всё, что нужно для одной доставки, - вычитывается из config.json одним
+/// заходом под замком.
+type PushState = (
+    Vec<PushSubscription>,
+    (bool, String, String, Option<String>),
+    Option<VapidKeys>,
+);
+
+fn read_push_state() -> PushState {
+    let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let c = crate::config::AppConfig::load_or_init();
+    (
+        c.push_subscriptions.clone(),
+        (
+            c.ntfy_enabled,
+            c.ntfy_url.clone().unwrap_or_default(),
+            c.ntfy_topic.clone().unwrap_or_default(),
+            c.ntfy_token.clone(),
+        ),
+        c.vapid_keys.clone(),
+    )
+}
+
+/// Работа с config.json (fs::read / fs::write+rename, под мьютексом) не должна
+/// идти на tokio-worker'е. Из async-контекста её уносит spawn_blocking, а из
+/// синхронного - block_in_place: HTTP-хендлеры push_subscribe/push_unsubscribe
+/// зовут add/remove_subscription напрямую и ждут результата, поэтому
+/// fire-and-forget тут неприемлем (подписка могла бы не успеть сохраниться до
+/// ответа телефону). Вне runtime'а (tauri-команды, тесты) выполняем как есть;
+/// на current-thread runtime block_in_place запрещён, поэтому проверяем flavor.
+fn run_blocking<R>(f: impl FnOnce() -> R) -> R {
+    let multi_thread = match tokio::runtime::Handle::try_current() {
+        Ok(h) => h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+        Err(_) => false,
+    };
+    if multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
 
 /// Notification router. Stateless: every operation re-reads config.json under
 /// the lock, so subscriptions added by the phone and ntfy toggles set in the
@@ -315,19 +371,23 @@ impl PushRouter {
     pub fn dispatch(&self, notice: &Notice) {
         let notice = notice.clone();
         tauri::async_runtime::spawn(async move {
-            let (subs, ntfy, vapid) = {
-                let _g = CONFIG_LOCK.lock().unwrap();
-                let c = crate::config::AppConfig::load_or_init();
-                (
-                    c.push_subscriptions.clone(),
-                    (
-                        c.ntfy_enabled,
-                        c.ntfy_url.clone().unwrap_or_default(),
-                        c.ntfy_topic.clone().unwrap_or_default(),
-                        c.ntfy_token.clone(),
-                    ),
-                    c.vapid_keys.clone(),
-                )
+            // permit живёт до конца доставки: больше MAX_INFLIGHT_DISPATCH
+            // одновременных отправок не бывает, лишние ждут, а не спавнятся вбок.
+            let _permit = match std::sync::Arc::clone(dispatch_permits()).acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("dsh-phone: dispatch semaphore closed");
+                    return;
+                }
+            };
+            // config.json читаем не на worker-потоке: там fs::read, а в
+            // load_or_init() ещё и детект tailscale IP (внешний процесс).
+            let (subs, ntfy, vapid) = match tokio::task::spawn_blocking(read_push_state).await {
+                Ok(state) => state,
+                Err(e) => {
+                    eprintln!("dsh-phone: push state read failed: {e}");
+                    return;
+                }
             };
             if let Some(vapid) = vapid {
                 if !subs.is_empty() {
@@ -356,47 +416,54 @@ impl PushRouter {
     }
 
     pub fn remove_subscription(&self, endpoint: &str) {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        let mut c = crate::config::AppConfig::load_or_init();
-        let before = c.push_subscriptions.len();
-        c.push_subscriptions.retain(|s| s.endpoint != endpoint);
-        if c.push_subscriptions.len() != before {
-            let _ = c.save();
-        }
+        let endpoint = endpoint.to_string();
+        run_blocking(move || {
+            let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = crate::config::AppConfig::load_or_init();
+            let before = c.push_subscriptions.len();
+            c.push_subscriptions.retain(|s| s.endpoint != endpoint);
+            if c.push_subscriptions.len() != before {
+                let _ = c.save();
+            }
+        });
     }
 
     pub fn add_subscription(&self, sub: PushSubscription) {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        let mut c = crate::config::AppConfig::load_or_init();
-        // Дедуп по endpoint + TTL + жёсткий cap. Браузер ротит подписку
-        // (pushsubscriptionchange каждый раз даёт новый endpoint), а единственный
-        // прежний prune срабатывал лишь при реальной отправке на 404/410 - поэтому
-        // мёртвые endpoint'ы копились в config.json навсегда, и файл рос на каждую
-        // операцию (add/remove/dispatch перечитывают и перезаписывают его целиком).
-        // created_at раньше только писался и нигде не читался - теперь это TTL.
-        const MAX_SUBS: usize = 32;
-        const SUB_TTL_SECS: f64 = 30.0 * 86400.0;
-        let now = crate::gateway::now_ts();
-        c.push_subscriptions
-            .retain(|s| s.endpoint != sub.endpoint && (now - s.created_at) < SUB_TTL_SECS);
-        c.push_subscriptions.push(sub);
-        if c.push_subscriptions.len() > MAX_SUBS {
-            c.push_subscriptions.sort_by(|a, b| {
-                a.created_at
-                    .partial_cmp(&b.created_at)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let cut = c.push_subscriptions.len() - MAX_SUBS;
-            c.push_subscriptions.drain(0..cut);
-        }
-        let _ = c.save();
+        run_blocking(move || {
+            let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = crate::config::AppConfig::load_or_init();
+            // Дедуп по endpoint + TTL + жёсткий cap. Браузер ротит подписку
+            // (pushsubscriptionchange каждый раз даёт новый endpoint), а единственный
+            // прежний prune срабатывал лишь при реальной отправке на 404/410 - поэтому
+            // мёртвые endpoint'ы копились в config.json навсегда, и файл рос на каждую
+            // операцию (add/remove/dispatch перечитывают и перезаписывают его целиком).
+            // created_at раньше только писался и нигде не читался - теперь это TTL.
+            const MAX_SUBS: usize = 32;
+            const SUB_TTL_SECS: f64 = 30.0 * 86400.0;
+            let now = crate::gateway::now_ts();
+            c.push_subscriptions
+                .retain(|s| s.endpoint != sub.endpoint && (now - s.created_at) < SUB_TTL_SECS);
+            c.push_subscriptions.push(sub);
+            if c.push_subscriptions.len() > MAX_SUBS {
+                c.push_subscriptions.sort_by(|a, b| {
+                    a.created_at
+                        .partial_cmp(&b.created_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let cut = c.push_subscriptions.len() - MAX_SUBS;
+                c.push_subscriptions.drain(0..cut);
+            }
+            let _ = c.save();
+        });
     }
 
     pub fn clear_subscriptions(&self) {
-        let _g = CONFIG_LOCK.lock().unwrap();
-        let mut c = crate::config::AppConfig::load_or_init();
-        c.push_subscriptions.clear();
-        let _ = c.save();
+        run_blocking(|| {
+            let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = crate::config::AppConfig::load_or_init();
+            c.push_subscriptions.clear();
+            let _ = c.save();
+        });
     }
 
 }
