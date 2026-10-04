@@ -41,6 +41,11 @@ DEFAULT_CONFIG = {
     "listenHost": "0.0.0.0",
     "listenPort": 8460,
     "gatewayToken": "",
+    # Кандидаты на endpoint.json: сначала наш плагин dsh-phone-bridge, затем
+    # мост Agents Anywhere. Порядок обязан совпадать с Rust-узлом.
+    "pluginBridgeEndpointPath": os.path.expanduser(
+        "~/.dsh/dsh-phone/bridge/endpoint.json"
+    ),
     "bridgeEndpointPath": os.path.expanduser(
         "~/.dsh/agents-anywhere/bridge/endpoint.json"
     ),
@@ -172,11 +177,35 @@ CONTENT_TYPES = {
 }
 
 
+def bridge_endpoint_paths(cfg):
+    """Кандидаты на endpoint.json в порядке приоритета: наш плагин, затем AA.
+
+    Логика повторяет Rust `AppConfig::bridge_endpoint_paths` (config.rs): пустые
+    значения отбрасываются, дубликаты схлопываются. Если бы порядок расходился,
+    exe- и python-версии узла подключались бы к разным мостам.
+    """
+    out = []
+    for key in ("pluginBridgeEndpointPath", "bridgeEndpointPath"):
+        path = (cfg.get(key) or "").strip()
+        if path and path not in out:
+            out.append(path)
+    return out
+
+
 class Bridge:
     """One authenticated connection to the DSH bridge (newline-delimited JSON-RPC)."""
 
     def __init__(self, endpoint_path, connector_id):
-        self.endpoint_path = endpoint_path
+        # endpoint_path: строка (старый вызов) или список кандидатов.
+        if isinstance(endpoint_path, str):
+            paths = [endpoint_path]
+        else:
+            paths = list(endpoint_path or [])
+        self.endpoint_paths = [p for p in paths if p]
+        # Оставлено для совместимости/диагностики: первый кандидат.
+        self.endpoint_path = self.endpoint_paths[0] if self.endpoint_paths else ""
+        # Какой файл реально привёл к подключению.
+        self.active_endpoint = None
         self.connector_id = connector_id
         self.reader = None
         self.writer = None
@@ -209,28 +238,36 @@ class Bridge:
             self._pending.pop(rid, None)
 
     async def connect(self):
+        last = RuntimeError("no bridge endpoint configured")
         for _ in range(2):
-            try:
-                ep = json.load(open(self.endpoint_path, encoding="utf-8"))
-                # Bridge allows frames up to ~8 MiB, but asyncio's default
-                # StreamReader limit is 64 KiB — a large getSnapshot would
-                # raise LimitOverrun and silently kill the whole connection.
-                # Raise the read buffer to 32 MiB so fat frames read cleanly.
-                self.reader, self.writer = await asyncio.open_connection(
-                    ep["host"], ep["port"], limit=32 * 1024 * 1024
-                )
-                # Start the reader BEFORE initialize: responses resolve futures here.
-                self._reader_task = asyncio.create_task(self.read_loop())
-                init = await self.request_raw_initialize(ep["token"])
-                ident = init.get("identity", {})
-                if ident.get("runtime") != "dsh":
-                    raise RuntimeError("bad identity")
-                self.connected = True
-                return True
-            except Exception as exc:
-                await self._close()
-                await asyncio.sleep(1.0)
-                last = exc
+            # Перебираем всех кандидатов: отсутствие файла нашего плагина не
+            # должно мешать подключению к AA (и наоборот).
+            for path in self.endpoint_paths:
+                try:
+                    ep = json.load(open(path, encoding="utf-8"))
+                    # Bridge allows frames up to ~8 MiB, but asyncio's default
+                    # StreamReader limit is 64 KiB — a large getSnapshot would
+                    # raise LimitOverrun and silently kill the whole connection.
+                    # Raise the read buffer to 32 MiB so fat frames read cleanly.
+                    self.reader, self.writer = await asyncio.open_connection(
+                        ep["host"], ep["port"], limit=32 * 1024 * 1024
+                    )
+                    # Start the reader BEFORE initialize: responses resolve futures here.
+                    self._reader_task = asyncio.create_task(self.read_loop())
+                    init = await self.request_raw_initialize(ep["token"])
+                    ident = init.get("identity", {})
+                    if ident.get("runtime") != "dsh":
+                        raise RuntimeError("bad identity")
+                    self.connected = True
+                    self.active_endpoint = path
+                    return True
+                except Exception as exc:
+                    await self._close()
+                    last = exc
+            # Пауза между полными проходами, а не между кандидатами: иначе
+            # отсутствующий endpoint нашего плагина добавлял бы секунду на
+            # каждом переподключении, даже когда мост AA прекрасно поднят.
+            await asyncio.sleep(1.0)
         raise last
 
     async def request_raw_initialize(self, token):
@@ -319,7 +356,7 @@ class Bridge:
 class Gateway:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.bridge = Bridge(cfg["bridgeEndpointPath"], cfg["connectorId"])
+        self.bridge = Bridge(bridge_endpoint_paths(cfg), cfg["connectorId"])
         self.bridge.on_notify = self._on_bridge_notify
         self.events = []  # [{ts, type, data}]
         self.events_ts = time.time()

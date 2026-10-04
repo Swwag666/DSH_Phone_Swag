@@ -86,11 +86,25 @@ pub fn clear_tls_runtime() {
 }
 
 async fn health(State(gw): State<Arc<Gateway>>) -> Response {
-    let ping = gw.main_hub().plugin_ping_snapshot();
+    let hub = gw.main_hub();
+    let ping = hub.plugin_ping_snapshot();
+    // Какой именно канал сейчас ведёт к рантайму: TCP-мост AA, наш нативный
+    // плагин или ничего. Дашборд и телефон видят это явно, вместо догадок по
+    // общему "bridge": connected при живом плагине и отсутствующем AA.
+    let channel = if hub.bridge.is_connected() {
+        "tcp"
+    } else if hub.plugin_alive() {
+        "plugin"
+    } else {
+        "none"
+    };
     let mut obj = json!({
         "ok": true,
         "runtime": "rust",
         "bridge": if gw.is_bridge_connected() { "connected" } else { "disconnected" },
+        "bridgeChannel": channel,
+        "bridgeEndpoint": hub.bridge.active_endpoint().await,
+        "pluginBridge": hub.plugin_metrics(),
         "uptime": gw.started_at.elapsed().as_secs(),
         "requests": gw.requests.load(Ordering::Relaxed),
         "version": env!("CARGO_PKG_VERSION"),
@@ -308,9 +322,11 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
             .unwrap_or("")
             .to_string();
         if !sid.is_empty() {
+            // Проверка занятости идёт через runtime_call, а не напрямую в мост:
+            // иначе при живом плагине и неподнятом TCP-мосте телефон никогда не
+            // узнал бы, что сессия уже работает.
             let busy = match hub
-                .bridge
-                .request(
+                .runtime_call(
                     "session.getState",
                     json!({ "sessionId": sid }),
                     Duration::from_secs(6),
@@ -342,9 +358,11 @@ async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response
     } else {
         String::new()
     };
+    // Единая точка выхода к рантайму: TCP-мост, если он поднят, иначе наш
+    // плагин (HTTP-канал команд). Без этого RPC телефона работали бы только
+    // через Agents Anywhere.
     match hub
-        .bridge
-        .request(&b.method, params, Duration::from_secs(120))
+        .runtime_call(&b.method, params, Duration::from_secs(120))
         .await
     {
         Ok(result) => {
@@ -807,6 +825,61 @@ async fn bridge_ingest(State(gw): State<Arc<Gateway>>, Json(b): Json<IngestBody>
     json_status(StatusCode::OK, json!({ "ok": true }))
 }
 
+#[derive(Deserialize)]
+struct PollBody {
+    #[serde(default)]
+    token: String,
+    /// Идентификатор экземпляра плагина (вкладка DSH) - для диагностики.
+    #[serde(rename = "pluginId", default)]
+    plugin_id: String,
+    /// Сколько секунд держать long-poll при пустой очереди.
+    #[serde(default)]
+    wait: Option<f64>,
+}
+
+/// Long-poll нативного плагина: отдаёт накопившиеся команды узла
+/// (session.list / getState / startTurn и остальные из WHITELIST). Плагин
+/// отвечает через /api/bridge/ingest type="result". Именно этот канал позволяет
+/// телефону управлять DSH Desktop без моста Agents Anywhere.
+async fn bridge_poll(State(gw): State<Arc<Gateway>>, Json(b): Json<PollBody>) -> Response {
+    let hub = match gw.find_hub(&b.token) {
+        Some(h) => h,
+        None => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({ "ok": false, "error": "unauthorized" }),
+            )
+        }
+    };
+    // 55 с - потолок: больше любого разумного ожидания и меньше дефолтных
+    // таймаутов HTTP-клиентов, чтобы long-poll не рвался по пути.
+    let wait = b.wait.unwrap_or(25.0).clamp(0.0, 55.0);
+    let mut rx = hub.plugin_gen_rx();
+    // Поколение фиксируем ДО чтения очереди (тот же приём, что в /api/events):
+    // команда, добавленная между подпиской и выборкой, разбудит rx.changed(),
+    // поэтому long-poll не может «проспать» уже лежащую в очереди команду.
+    let _ = rx.borrow_and_update();
+    let mut cmds = hub.plugin_take_commands(8);
+    if cmds.is_empty() && wait > 0.0 {
+        tokio::select! {
+            _ = rx.changed() => {},
+            _ = tokio::time::sleep(Duration::from_secs_f64(wait)) => {},
+        }
+        cmds = hub.plugin_take_commands(8);
+    }
+    let n = cmds.len();
+    json_status(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "commands": cmds,
+            "count": n,
+            "pluginId": b.plugin_id,
+            "ts": now_ts(),
+        }),
+    )
+}
+
 /// Шлёт сигнал остановки фоновым задачам serve в момент drop - то есть на любом
 /// выходе из serve (успех, ошибка бинда/TLS, abort из stop_inner). Без этого
 /// staging-loop и loopback-листенер жили вечно после остановки узла.
@@ -835,6 +908,7 @@ fn build_router(gw: &Arc<Gateway>) -> Router {
         .route("/api/events", get(events))
         .route("/api/draft-config", get(draft_config))
         .route("/api/bridge/ingest", post(bridge_ingest))
+        .route("/api/bridge/poll", post(bridge_poll))
         .route("/api/watch", post(watch))
         .route("/api/push/info", get(push_info))
         .route("/api/push/subscribe", post(push_subscribe))
@@ -966,6 +1040,7 @@ fn spawn_loopback_http(gw: Arc<Gateway>, port: u16, mut stop: tokio::sync::watch
         .route("/api/health", get(health))
         .route("/api/draft-config", get(draft_config))
         .route("/api/bridge/ingest", post(bridge_ingest))
+        .route("/api/bridge/poll", post(bridge_poll))
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
         .route("/api/watch", post(watch))

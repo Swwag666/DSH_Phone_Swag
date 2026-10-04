@@ -1,8 +1,8 @@
 # DSH Phone - гайд по установке от и до
 
-Цель гайда: после последнего шага телефон управляет сессиями DSH со стабильной связью, и ты знаешь, где чинить, если что-то отвалилось. Версия: **0.3.0** (hardening-релиз: header-аутентификация, HTTP/1.1 keep-alive, самоочистка staging, динамический hosts-фикс).
+Цель гайда: после последнего шага телефон управляет сессиями DSH со стабильной связью, и ты знаешь, где чинить, если что-то отвалилось. Версия: **0.4.0** плюс unreleased-изменения в `main` (свой мост: плагин `dsh-phone-bridge` поднимает TCP-мост внутри DSH Desktop, поэтому Agents Anywhere больше не обязателен; узел ищет endpoint'ы по списку и держит HTTP-канал плагина как третий путь). Номер версии поднимается только вместе с релизом: тесты `updater_release` требуют совпадения версии в `tauri.conf.json`, в `releases/latest.example.json` и в trusted-comment подписи.
 
-Схема такая: телефон → Tailscale → узел на твоём ПК (порт 8460) → плагин Agents Anywhere в DSH Desktop. Четыре звена, каждое проверяется отдельно - гайд построен по этому принципу: поставил звено, проверил звено.
+Схема такая: телефон → Tailscale → узел на твоём ПК (порт 8460) → мост в DSH Desktop (наш плагин `dsh-phone-bridge`, а если он не стоит - плагин Agents Anywhere). Четыре звена, каждое проверяется отдельно - гайд построен по этому принципу: поставил звено, проверил звено.
 
 ---
 
@@ -13,7 +13,8 @@
 | Windows 10/11 | уже есть | ПК-узел |
 | [Tailscale](https://tailscale.com/download) | tailscale.com | приватный туннель ПК ↔ телефон |
 | DeepSeek Harness Desktop | твой дистрибутив | сам агент |
-| Плагин **Agents Anywhere** | включается в DSH Desktop | мост JSON-RPC |
+| Плагин **dsh-phone-bridge** | `dsh-phone/plugin/dsh-phone-bridge` в этом репо | свой мост JSON-RPC, рекомендуется |
+| Плагин **Agents Anywhere** | включается в DSH Desktop | запасной мост JSON-RPC |
 | `releases/dsh-phone-setup.exe` | из этого репо | узел |
 
 Время: ~10 минут, если Tailscale уже стоит.
@@ -32,15 +33,49 @@
 
 ---
 
-## 2. DSH Desktop + плагин Agents Anywhere
+## 2. DSH Desktop + мост
+
+Мост - это то, через что узел дёргает агента. Вариант A рекомендуется: наш
+плагин не зависит от Agents Anywhere, не требует учётки и облака, и узел пробует
+его первым. Вариант B пригодится, если свой плагин поставить нельзя.
+
+### Вариант A (рекомендуется): свой плагин dsh-phone-bridge
+
+1. Запусти DeepSeek Harness Desktop, залогинься и **закрой** его.
+2. Скопируй папку `dsh-phone\plugin\dsh-phone-bridge` из этого репо в
+   `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-phone-bridge\`.
+3. В `%USERPROFILE%\.dsh\profiles\desktop\package.json` добавь строку
+   `"dsh-phone-bridge"` в массив `dsh.profile.bundles`.
+4. Запусти DSH Desktop.
+
+Проверка звена: появился файл
+`%USERPROFILE%\.dsh\dsh-phone\bridge\endpoint.json` - в нём адрес TCP-моста,
+который узел читает при старте.
+
+> Записи нет в lockfile профиля, поэтому любая команда вида
+> `dsh plugin --profile desktop add ...` (или pnpm install в профиле) может
+> снести папку - просто скопируй её заново из репо.
+
+### Вариант B: плагин Agents Anywhere
 
 1. Запусти DeepSeek Harness Desktop, залогинься.
 2. Включи плагин **Agents Anywhere** (настройки → плагины).
-3. Проверь, что появился файл `~/.dsh/agents-anywhere/bridge/endpoint.json` (в проводнике: `C:\Users\<ты>\.dsh\agents-anywhere\bridge\`). В нём адрес TCP-моста - узел читает его при старте.
+3. Проверь, что появился файл `~/.dsh/agents-anywhere/bridge/endpoint.json`
+   (в проводнике: `C:\Users\<ты>\.dsh\agents-anywhere\bridge\`).
 
 Вход в учётку Agents Anywhere **не нужен** - узел стучится в локальный файл, не в облако.
 
-Проверка звена: файл `endpoint.json` существует. Нет файла - переустанови/пере включи плагин, перезапусти DSH Desktop.
+### Как проверить, какая дверь открыта
+
+После шага 3 (узел запущен) открой `http://127.0.0.1:8460/api/health`:
+
+- `bridgeChannel: "tcp"` + `bridgeEndpoint` - TCP-мост поднят, в `bridgeEndpoint`
+  видно, какой именно файл сработал (наш или AA);
+- `bridgeChannel: "plugin"` - TCP-моста нет, но жива web-половина плагина:
+  статус и события идут по HTTP, в `pluginBridge` видны очередь, rtt и возраст
+  последнего пуша;
+- `bridgeChannel: "none"` - не открыта ни одна дверь: проверь файлы
+  `endpoint.json` и что DSH Desktop запущен.
 
 ---
 
@@ -114,11 +149,17 @@
 4. `100.x.x.x` совпадает с тем, что показывает узел в окне? IP мог смениться.
 5. Всё ок, но по-прежнему таймаут → WARP-конфликт, см. ниже.
 
-**«Мост отключён» в интерфейсе / health показывает `bridge: disconnected`**
+**«Мост отключён» в интерфейсе / health показывает `bridgeChannel: "none"`**
 1. DSH Desktop запущен и залогинен?
-2. Плагин Agents Anywhere включён?
-3. `~/.dsh/agents-anywhere/bridge/endpoint.json` существует?
-4. Перезапусти DSH Phone (узел переподключается к мосту при старте).
+2. Открыта ли хоть одна дверь: `~/.dsh/dsh-phone/bridge/endpoint.json` (наш
+   плагин) или `~/.dsh/agents-anywhere/bridge/endpoint.json` (AA)?
+3. Наш плагин скопирован в профиль и перечислен в `dsh.profile.bundles`? После
+   правки `package.json` профиля DSH Desktop надо перезапустить.
+4. Перезапусти DSH Phone: узел переподключается при старте и перебирает оба
+   endpoint'а по списку (наш первым).
+5. `bridgeChannel: "plugin"` при установленном плагине означает, что его
+   TCP-мост не поднялся (причина в логе DSH Desktop), но web-половина жива:
+   статус и события идут по HTTP, а метрики видны в `pluginBridge`.
 
 **Связь отвалилась после включения/выключения Cloudflare WARP** - WARP и Tailscale рвут друг другу сокеты. Кнопка **«Лечить связь»** в конфиг-карточке узла перевязывает сокеты (`debug rebind` + `restun`). Если часто повторяется - запусти `tools/fix-tailscale-warp.bat`: он пропишет в hosts актуальные адреса controlplane/login Tailscale (резолвит через 4 публичных DNS с консенсусом, бэкапит hosts перед записью; если резолв не сошёлся - файл не трогает).
 
@@ -133,11 +174,11 @@
 ## Чек-лист «воркает чётко» (можно распечатать)
 
 - [ ] Tailscale на ПК и на телефоне, один аккаунт, ping проходит
-- [ ] DSH Desktop запущен, плагин AA включён, `endpoint.json` на месте
+- [ ] DSH Desktop запущен, мост открыт: наш плагин `dsh-phone-bridge` (или AA), его `endpoint.json` на месте
 - [ ] Узел запущен (иконка в трее), порт 8460
 - [ ] `fix-firewall.bat` выполнен от админа
 - [ ] `allowed_ips` заполнен (`100.64.0.0/10`)
-- [ ] `http://127.0.0.1:8460/api/health` → `"bridge":"connected"`
+- [ ] `http://127.0.0.1:8460/api/health` → `bridgeChannel` равен `"tcp"` (или `"plugin"`)
 - [ ] Телефон: `http://100.x.x.x:8460`, токен введён, PWA на домашнем экране
 - [ ] Тестовое сообщение агенту - ответ застримился
 - [ ] (опция) TLS включён, отпечаток сверить

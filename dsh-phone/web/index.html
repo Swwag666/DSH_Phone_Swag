@@ -8,8 +8,8 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="DSH" />
   <title>DSH PHONE</title>
-  <link rel="manifest" href="/manifest.json?v=21" />
-  <link rel="stylesheet" href="/style.css?v=21" />
+  <link rel="manifest" href="/manifest.json?v=22" />
+  <link rel="stylesheet" href="/style.css?v=22" />
   <style>
     #prompt-templates { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 2px; }
     .tpl-chip { background: #1a1826; color: #cfcec6; border: 1px solid #2e2b3d; border-radius: 14px; padding: 5px 11px; font-size: 12px; line-height: 1.2; cursor: pointer; font-family: inherit; }
@@ -157,10 +157,10 @@
   <div class="scanlines"></div>
   <div class="crt-sweep"></div>
 
-  <script src="/md.js?v=21"></script>
-  <script src="/itemrender.js?v=21"></script>
-  <script src="/draftsync.js?v=21"></script>
-  <script src="/app.js?v=21"></script>
+  <script src="/md.js?v=22"></script>
+  <script src="/itemrender.js?v=22"></script>
+  <script src="/draftsync.js?v=22"></script>
+  <script src="/app.js?v=22"></script>
   <script>
     (function () {
       var $ = function (id) { return document.getElementById(id); };
@@ -181,7 +181,21 @@
       function refreshInfo() {
         fetch("/api/health").then(function (r) { return r.json(); }).then(function (h) {
           var on = h && h.bridge === "connected";
-          var html = '<div class="menu-row"><span>мост</span><span' + (on ? ' class="live"' : "") + '>' + (on ? "соединён" : "разорван") + "</span></div>";
+          // какой именно канал жив: tcp (мост нашего плагина или AA) либо
+          // plugin (HTTP-канал web-половины плагина)
+          var ch = h && h.bridgeChannel ? h.bridgeChannel
+            : (h && h.pluginBridge && h.pluginBridge.alive ? "plugin" : "");
+          var bridgeText = !on ? "разорван"
+            : ch === "plugin" ? "соединён · плагин HTTP"
+            : ch === "tcp" ? "соединён · TCP-мост"
+            : "соединён";
+          var html = '<div class="menu-row"><span>мост</span><span' + (on ? ' class="live"' : "") + '>' + bridgeText + "</span></div>";
+          var pb = h && h.pluginBridge;
+          if (pb && (pb.connected || pb.alive)) {
+            html += '<div class="menu-row"><span>плагин</span><span>v' + (pb.version == null ? "?" : pb.version)
+              + ' · очередь ' + (pb.queue || 0)
+              + ' · ' + (pb.rttMs == null ? "rtt —" : pb.rttMs + " мс") + "</span></div>";
+          }
           html += '<div class="menu-row"><span>аптайм</span><span>' + (h ? fmtUptime(h.uptime || 0) : "—") + "</span></div>";
           html += '<div class="menu-row"><span>запросов</span><span>' + (h ? (h.requests || 0) : "—") + "</span></div>";
           $("menu-info").innerHTML = html;

@@ -6,7 +6,7 @@
 
 твой ПК · твой телефон · один ключ · ноль посредников
 
-[![release](https://img.shields.io/badge/release-v0.3.0-8a3838?style=flat-square)](https://github.com/Swwag666/DSH_Phone_Swag/releases)
+[![release](https://img.shields.io/badge/release-v0.4.0-8a3838?style=flat-square)](https://github.com/Swwag666/DSH_Phone_Swag/releases)
 [![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-232030?style=flat-square)](#)
 [![stack](https://img.shields.io/badge/stack-Rust%20·%20Tauri%20v2%20·%20axum-7e2233?style=flat-square)](#как-это-устроено)
 [![license](https://img.shields.io/badge/license-MIT-6c9a62?style=flat-square)](LICENSE)
@@ -42,7 +42,7 @@
 
 > Камера не берёт? В той же карточке есть кнопка «скопировать ссылку», а обычный путь никуда не делся: открой `http://<твой-IP>:8460` и вставь токен из карточки «Ключ доступа».
 
-> **Важно:** на ПК должен быть запущен DeepSeek Harness Desktop с включённым плагином Agents Anywhere - это единственная дверь, через которую узел говорит с агентом. Вход в учётку AA не нужен.
+> **Важно:** на ПК должен быть запущен DeepSeek Harness Desktop. Дверь к агенту - одна из двух: наш плагин [`dsh-phone-bridge`](dsh-phone/plugin/dsh-phone-bridge) (ставится один раз, поднимает собственный TCP-мост и не требует ни облака, ни учётки) либо плагин Agents Anywhere (вход в учётку AA тоже не нужен). Узел пробует наш мост первым, AA держит запасным; если не поднят ни один, остаётся HTTP-канал web-половины плагина.
 
 ## Что умеет
 
@@ -59,6 +59,7 @@
 - **Уведомления и непрочитанные** - бейджи, пуши о завершении хода, статистика (время хода, токены, оценка стоимости)
 - **QR-подключение** - навёл камеру, телефон вошёл сам: токен лежит в hash-фрагменте ссылки и не уходит в логи узла
 - **Автообновление** - дашборд сам проверяет GitHub Releases и ставит новую версию с прогрессом скачивания
+- **Независимость от Agents Anywhere** - свой плагин поднимает мост прямо внутри DSH Desktop; AA остаётся запасным, а если не поднят ни один мост, телефон живёт через HTTP-канал web-половины плагина
 
 <div align="center">
 <img src="docs/shot_toggles.png" alt="тумблеры" width="32%"/>
@@ -84,10 +85,11 @@
 │                                   │  whitelist RPC · allowlist IP    │ │
 │                                   └───────────────┬─────────────────┘ │
 └───────────────────────────────────────────────────┼────────────────────┘
-                                                    │ JSON-RPC (TCP)
+                                                    │ JSON-RPC (TCP), запасной путь - HTTP
                                        ┌────────────▼────────────┐
                                        │ DeepSeek Harness Desktop │
-                                       │ плагин Agents Anywhere   │
+                                       │ плагин dsh-phone-bridge  │
+                                       │ запасной: Agents Anywhere│
                                        └─────────────────────────┘
                                                     │ Tailscale (100.x)
                                               ┌─────▼─────┐
@@ -121,7 +123,8 @@
 | `staging_retention_secs` | срок жизни загруженных файлов в staging (по умолчанию 7 дней) |
 | `tls_enabled` | TLS поверх tailnet |
 | `start_hidden` | старт свёрнутым в трей |
-| `bridge_endpoint_path` | файл моста AA (`~/.dsh/agents-anywhere/bridge/endpoint.json`) |
+| `plugin_bridge_endpoint_path` | файл моста нашего плагина (`~/.dsh/dsh-phone/bridge/endpoint.json`) - пробуется первым |
+| `bridge_endpoint_path` | файл моста AA (`~/.dsh/agents-anywhere/bridge/endpoint.json`) - запасной |
 
 ## Python-гейтвей - лёгкий вариант
 
@@ -136,7 +139,7 @@ run.bat        :: или: python gateway.py
 
 ## Траблшутинг
 
-- **«Мост отключён» / пусто** - проверь, что DSH Desktop запущен и плагин Agents Anywhere включён; файл `~/.dsh/agents-anywhere/bridge/endpoint.json` должен существовать.
+- **«Мост отключён» / пусто** - DSH Desktop должен быть запущен и хотя бы одна дверь открыта: `~/.dsh/dsh-phone/bridge/endpoint.json` (наш плагин) или `~/.dsh/agents-anywhere/bridge/endpoint.json` (AA). Что реально видит узел, показывает `GET /api/health`: `bridgeChannel` (`tcp` / `plugin` / `none`), `bridgeEndpoint` (какой файл сработал) и `pluginBridge` (метрики HTTP-канала: очередь, rtt, возраст последнего пуша).
 - **Телефон не видит узел** - запусти `tools/fix-firewall.bat` от администратора (правило для порта 8460), проверь что оба устройства в одном tailnet.
 - **Связь отвалилась после включения/выключения WARP** - кнопка «Лечить связь» в конфиг-карточке: узел перевязывает сокеты tailscaled (`debug rebind` + `restun`).
 - **После обновления приложения** - закрой и открой страницу на телефоне заново.
@@ -152,7 +155,7 @@ run.bat        :: или: python gateway.py
 - [x] QR-подключение телефона без набора токена
 - [x] Автообновление из GitHub Releases + CI на таг
 - [x] Нативные оболочки (Capacitor): проект `dsh-phone/mobile` (android/ + ios/) готов к сборке; сборка APK/IPA и публикация в сторы требуют Android SDK+JDK / macOS+Xcode и аккаунтов разработчика
-- [x] Свой плагин DSH (`dsh-phone-bridge`) вместо моста AA: плагин пушит сессии/события/статус узлу по HTTP (`/api/bridge/ingest`), узел независим от Agents Anywhere
+- [x] Свой плагин DSH (`dsh-phone-bridge`) вместо моста AA: host-половина поднимает TCP-мост с протоколом AA (`~/.dsh/dsh-phone/bridge/endpoint.json`), web-половина держит HTTP-канал команд (`/api/bridge/ingest` + `/api/bridge/poll`); узел пробует наш мост первым, AA остаётся запасным
 
 ## Сборка из исходников
 
@@ -198,7 +201,7 @@ npx tauri signer generate -w ~/.dsh-phone-updater/dsh-phone-updater.key
 
 > Потеряешь ключ - подписывать обновления станет нечем, и поставленные версии перестанут обновляться. Храни копию вне машины.
 
-Порядок выпуска версии: поднять `version` в `dsh-phone-desktop/src-tauri/tauri.conf.json` и `package.json`, обновить бейдж в начале README, закоммитить, затем `git tag v0.4.0 && git push origin v0.4.0`.
+Порядок выпуска версии: поднять `version` в `dsh-phone-desktop/src-tauri/tauri.conf.json`, `Cargo.toml` и `package.json` (плюс `dsh-phone/mobile/package.json` и `dsh-phone/plugin/dsh-phone-bridge/package.json`), обновить бейдж в начале README, **вместе с этим** пересобрать `releases/` и `latest.json` (нужен ключ подписи), закоммитить, затем `git tag v<версия> && git push origin v<версия>` — CI соберёт артефакты сам. Поднимать версию в отрыве от артефактов нельзя: тесты `updater_release` проверяют, что версия в `tauri.conf.json`, в `releases/latest.example.json` и в trusted-comment подписи совпадает, иначе апдейтер на телефонах отвергнет обновление.
 
 > Подпись апдейтера (minisign) - это не код-сининг: SmartScreen по-прежнему будет ругаться на отсутствие сертификата. Она защищает другое - гарантирует, что обновление приехало от тебя, а не от того, кто подменил файл на диске или в канале доставки.
 

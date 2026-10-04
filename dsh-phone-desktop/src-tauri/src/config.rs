@@ -22,6 +22,10 @@ pub struct AppConfig {
     pub created_at_unix: u64,
     #[serde(default = "default_bridge_endpoint")]
     pub bridge_endpoint_path: String,
+    /// Endpoint нашего нативного плагина dsh-phone-bridge. Пробуется ПЕРЕД
+    /// agents-anywhere, поэтому телефон работает и при полностью выключенном AA.
+    #[serde(default = "default_plugin_bridge_endpoint")]
+    pub plugin_bridge_endpoint_path: String,
     #[serde(default = "default_poll_seconds")]
     pub poll_seconds: f64,
     #[serde(default = "default_event_buffer_max")]
@@ -52,6 +56,25 @@ pub struct AppConfig {
     pub ntfy_token: Option<String>,
 }
 
+impl AppConfig {
+    /// Кандидаты на endpoint.json в порядке приоритета: сначала наш нативный
+    /// плагин, затем мост Agents Anywhere. Пустые значения и дубликаты
+    /// отбрасываются, чтобы один и тот же файл не пробовался дважды.
+    pub fn bridge_endpoint_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for p in [
+            self.plugin_bridge_endpoint_path.clone(),
+            self.bridge_endpoint_path.clone(),
+        ] {
+            let t = p.trim();
+            if !t.is_empty() && !out.iter().any(|x| x == t) {
+                out.push(t.to_string());
+            }
+        }
+        out
+    }
+}
+
 fn ser_opt_string<S: serde::Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(v.as_deref().unwrap_or(""))
 }
@@ -66,10 +89,26 @@ pub fn random_topic() -> String {
     format!("dsh-{}", new_token())
 }
 
-fn default_bridge_endpoint() -> String {
+/// Каталог DSH: DSH_HOME, если он задан абсолютным путём, иначе ~/.dsh. Порядок
+/// тот же, что у мостов DSH (и у плагина AA, и у нашего), поэтому узел ищет
+/// endpoint.json ровно там, куда его пишут.
+fn dsh_home() -> PathBuf {
+    if let Ok(h) = std::env::var("DSH_HOME") {
+        let t = h.trim();
+        if !t.is_empty() {
+            let p = PathBuf::from(t);
+            if p.is_absolute() {
+                return p;
+            }
+        }
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".dsh")
+}
+
+fn default_bridge_endpoint() -> String {
+    dsh_home()
         .join("agents-anywhere")
         .join("bridge")
         .join("endpoint.json")
@@ -78,6 +117,18 @@ fn default_bridge_endpoint() -> String {
 }
 fn default_poll_seconds() -> f64 {
     1.0
+}
+
+/// Endpoint нашего плагина: тот же формат файла, что у AA ({version,host,port,
+/// token,pid}), но своя директория, чтобы два моста не спорили за один файл и
+/// не мешали друг другу при совместной работе.
+fn default_plugin_bridge_endpoint() -> String {
+    dsh_home()
+        .join("dsh-phone")
+        .join("bridge")
+        .join("endpoint.json")
+        .to_string_lossy()
+        .to_string()
 }
 fn default_event_buffer_max() -> usize {
     400
@@ -397,6 +448,7 @@ impl AppConfig {
             connector_id: "dsh-phone".to_string(),
             created_at_unix: now(),
             bridge_endpoint_path: default_bridge_endpoint(),
+            plugin_bridge_endpoint_path: default_plugin_bridge_endpoint(),
             poll_seconds: default_poll_seconds(),
             event_buffer_max: 400,
             max_attachment_bytes: 50 * 1024 * 1024,
@@ -559,6 +611,63 @@ mod tests {
     fn generated_defaults_have_staging_retention() {
         let c = AppConfig::generate();
         assert_eq!(c.staging_retention_secs, 7 * 86400);
+    }
+
+    #[test]
+    fn bridge_endpoint_paths_prefers_native_plugin_and_dedupes() {
+        let mut c = AppConfig::generate();
+        c.plugin_bridge_endpoint_path = "C:/home/.dsh/dsh-phone/bridge/endpoint.json".into();
+        c.bridge_endpoint_path = "C:/home/.dsh/agents-anywhere/bridge/endpoint.json".into();
+        let p = c.bridge_endpoint_paths();
+        assert_eq!(p.len(), 2);
+        assert!(p[0].contains("dsh-phone"), "наш плагин пробуется первым");
+        assert!(p[1].contains("agents-anywhere"), "AA - запасной вариант");
+        // одинаковые пути не дублируются
+        c.bridge_endpoint_path = p[0].clone();
+        assert_eq!(c.bridge_endpoint_paths(), vec![p[0].clone()]);
+        // пустой/пробельный путь отбрасывается, а не попадает в список
+        c.plugin_bridge_endpoint_path = "   ".into();
+        assert_eq!(c.bridge_endpoint_paths(), vec![p[0].clone()]);
+    }
+
+    #[test]
+    fn default_endpoint_paths_cover_plugin_and_aa() {
+        let c = AppConfig::generate();
+        let p = c.bridge_endpoint_paths();
+        assert_eq!(p.len(), 2, "по умолчанию оба кандидата заполнены");
+        let norm = |s: &str| s.replace('\\', "/");
+        assert!(
+            norm(&p[0]).ends_with("/dsh-phone/bridge/endpoint.json"),
+            "получили: {}",
+            p[0]
+        );
+        assert!(
+            norm(&p[1]).ends_with("/agents-anywhere/bridge/endpoint.json"),
+            "получили: {}",
+            p[1]
+        );
+    }
+
+    #[test]
+    fn old_config_without_plugin_endpoint_gets_the_default() {
+        // Конфиги, созданные до появления своего плагина, не должны терять
+        // кандидата: поле подтягивается из serde-default.
+        let raw = serde_json::json!({
+            "config_path": "x.json",
+            "token": "0123456789abcdef0123456789abcdef",
+            "listen_host": "0.0.0.0",
+            "listen_port": 8460,
+            "staging_path": "stage",
+            "tailscale_ip": "127.0.0.1",
+            "connector_id": "dsh-phone",
+            "created_at_unix": 1,
+            "bridge_endpoint_path": "C:/x/agents-anywhere/bridge/endpoint.json"
+        });
+        let c: AppConfig = serde_json::from_value(raw).expect("old config parses");
+        assert!(c.plugin_bridge_endpoint_path.contains("dsh-phone"));
+        let p = c.bridge_endpoint_paths();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[1], "C:/x/agents-anywhere/bridge/endpoint.json");
     }
 
     #[test]

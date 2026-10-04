@@ -50,7 +50,12 @@ pub fn read_endpoint(path: &str) -> Result<BridgeEndpoint, String> {
 
 /// One authenticated connection to the DSH bridge (newline-delimited JSON-RPC over TCP).
 pub struct Bridge {
-    pub endpoint_path: String,
+    /// Кандидаты на endpoint.json в порядке приоритета: сначала наш нативный
+    /// плагин dsh-phone-bridge, затем мост Agents Anywhere. Первый живой
+    /// выигрывает, поэтому узел работает и при полностью выключенном AA.
+    pub endpoint_paths: Vec<String>,
+    /// Какой путь реально привёл к подключению - для диагностики в /api/health.
+    active_path: Mutex<Option<String>>,
     pub connector_id: String,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     next_id: AtomicU64,
@@ -70,12 +75,13 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn new(
-        endpoint_path: String,
+        endpoint_paths: Vec<String>,
         connector_id: String,
         notify_tx: mpsc::Sender<Value>,
     ) -> Arc<Self> {
         Arc::new(Bridge {
-            endpoint_path,
+            endpoint_paths,
+            active_path: Mutex::new(None),
             connector_id,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -146,7 +152,9 @@ impl Bridge {
                 "runtime": "dsh",
                 "connectorId": self.connector_id.clone(),
                 "sessionNamespace": self.connector_id.clone(),
-                "clientInfo": { "name": "dsh-phone-desktop", "version": "0.1.0" }
+                // Версию берём из Cargo.toml на этапе компиляции: захардкоженная
+                // "0.1.0" разъехалась с реальной и врала в логах моста.
+                "clientInfo": { "name": "dsh-phone-desktop", "version": env!("CARGO_PKG_VERSION") }
             }
         });
         if let Err(e) = self.write_frame(&frame).await {
@@ -206,7 +214,30 @@ impl Bridge {
     async fn try_connect_once(self: &Arc<Self>) -> Result<(), String> {
         let gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.clear_local_state().await;
-        let ep = read_endpoint(&self.endpoint_path)?;
+        // Перебираем кандидатов (наш плагин, затем AA). Отсутствие или протухший
+        // endpoint.json одного из них не должен ронять подключение целиком.
+        let mut errs: Vec<String> = Vec::new();
+        for path in self.endpoint_paths.iter() {
+            match self.try_endpoint(path, gen).await {
+                Ok(()) => {
+                    *self.active_path.lock().await = Some(path.clone());
+                    return Ok(());
+                }
+                Err(e) => errs.push(format!("{path}: {e}")),
+            }
+        }
+        *self.active_path.lock().await = None;
+        if errs.is_empty() {
+            return Err("no bridge endpoint configured".to_string());
+        }
+        Err(errs.join(" | "))
+    }
+
+    /// Подключение к одному endpoint.json: чтение, TCP, initialize, проверка
+    /// identity. Любая ошибка откатывает состояние, чтобы следующий кандидат
+    /// стартовал с чистого листа.
+    async fn try_endpoint(self: &Arc<Self>, path: &str, gen: u64) -> Result<(), String> {
+        let ep = read_endpoint(path)?;
         let addr = format!("{}:{}", ep.host, ep.port);
         let stream = TcpStream::connect(&addr)
             .await
@@ -219,7 +250,13 @@ impl Bridge {
         *self.write.lock().await = Some(write_half);
         let reader = self.spawn_reader(read_half, gen);
         *self.reader.lock().await = Some(reader);
-        let init = self.request_initialize(&ep.token).await?;
+        let init = match self.request_initialize(&ep.token).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.clear_local_state().await;
+                return Err(e);
+            }
+        };
         let ident = init.get("identity").cloned().unwrap_or(Value::Null);
         if ident.get("runtime").and_then(|x| x.as_str()) != Some("dsh") {
             self.clear_local_state().await;
@@ -227,6 +264,11 @@ impl Bridge {
         }
         self.connected.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Какой endpoint.json сейчас в работе (None - ни один не подошёл).
+    pub async fn active_endpoint(&self) -> Option<String> {
+        self.active_path.lock().await.clone()
     }
 
     fn spawn_reader(

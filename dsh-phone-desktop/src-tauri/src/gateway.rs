@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::bridge::Bridge;
 use crate::push::PushRouter;
@@ -52,6 +52,27 @@ const WATCH_POLL_CONCURRENCY: usize = 4;
 
 /// One phone-facing device: its own bridge connector, its own event feed,
 /// its own watched sessions. Main device + every extra device.
+/// Команда узла нативному плагину: исходящий RPC поверх HTTP. Плагин забирает
+/// очередь long-poll'ом /api/bridge/poll и возвращает результат через ingest.
+#[derive(Clone)]
+pub struct PluginCommand {
+    pub id: String,
+    pub method: String,
+    pub params: Value,
+    pub queued_at: f64,
+}
+
+/// Очередь команд плагину ограничена: при переполнении отбрасываем самую старую
+/// команду и будим её ожидателя, вместо того чтобы копить неактуальные вызовы.
+const PLUGIN_QUEUE_CAP: usize = 64;
+/// Сколько команд отдаём за один poll: плагин выполняет их параллельно, но
+/// большой батч отложил бы срочный session.startTurn.
+const PLUGIN_POLL_BATCH: usize = 8;
+/// Heartbeat плагина приходит раз в 15 с, поэтому 45 с тишины - это обрыв
+/// канала. Без проверки свежести закрытая вкладка DSH навсегда оставила бы узел
+/// «подключённым» и телефон ждал бы ответов от мёртвого плагина.
+const PLUGIN_STALE_SECS: f64 = 45.0;
+
 pub struct DeviceHub {
     pub name: String,
     pub token: String,
@@ -61,6 +82,9 @@ pub struct DeviceHub {
     /// TCP-мост Agents Anywhere. Пока плагин шлёт heartbeat, узел считается
     /// подключённым даже без endpoint.json/AA - независимость от внешнего моста.
     plugin_connected: AtomicBool,
+    /// Поколение очереди команд плагина: будит long-poll в /api/bridge/poll.
+    plugin_gen: AtomicU64,
+    plugin_gen_tx: watch::Sender<u64>,
     state: Mutex<HubState>,
     outbox: Mutex<VecDeque<OutgoingTurn>>,
     gen: AtomicU64,
@@ -110,6 +134,18 @@ struct HubState {
     drafts: HashMap<String, DraftEntry>,
     /// Last plugin heartbeat from the DSH Desktop side client.
     plugin_ping: Option<Value>,
+    /// Очередь команд для нативного плагина (забирается через /api/bridge/poll).
+    plugin_queue: VecDeque<PluginCommand>,
+    /// Команды, отданные плагину и ждущие ответа: id -> канал результата.
+    plugin_pending: HashMap<String, oneshot::Sender<Value>>,
+    /// Рукопожатие плагина: версия, источник, заявленные возможности.
+    plugin_info: Option<Value>,
+    /// Время любого последнего push от плагина (heartbeat, события, результаты).
+    plugin_last_push: f64,
+    /// Сколько команд отброшено при переполнении очереди (диагностика).
+    plugin_dropped: u64,
+    /// Последняя измеренная задержка ответа плагина, мс.
+    plugin_rtt_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -171,7 +207,7 @@ impl DeviceHub {
         name: String,
         token: String,
         connector_id: String,
-        endpoint_path: String,
+        endpoint_paths: Vec<String>,
         event_buffer_max: usize,
         poll_seconds: f64,
         push: PushRouter,
@@ -183,13 +219,15 @@ impl DeviceHub {
         let (notify_tx, notify_rx) =
             mpsc::channel::<Value>(crate::bridge::NOTIFY_CHANNEL_CAP);
         let (gen_tx, _) = watch::channel(0u64);
-        let bridge = Bridge::new(endpoint_path, connector_id.clone(), notify_tx);
+        let bridge = Bridge::new(endpoint_paths, connector_id.clone(), notify_tx);
         let hub = Arc::new(DeviceHub {
             name,
             token,
             connector_id,
             bridge,
             plugin_connected: AtomicBool::new(false),
+            plugin_gen: AtomicU64::new(0),
+            plugin_gen_tx: watch::channel(0u64).0,
             state: Mutex::new(HubState {
                 events: VecDeque::new(),
                 events_bytes: 0,
@@ -199,6 +237,12 @@ impl DeviceHub {
                 candidates: HashMap::new(),
                 drafts: HashMap::new(),
                 plugin_ping: None,
+                plugin_queue: VecDeque::new(),
+                plugin_pending: HashMap::new(),
+                plugin_info: None,
+                plugin_last_push: 0.0,
+                plugin_dropped: 0,
+                plugin_rtt_ms: None,
             }),
             outbox: Mutex::new(VecDeque::new()),
             gen: AtomicU64::new(0),
@@ -313,7 +357,7 @@ impl DeviceHub {
                     json!({ "reason": "stale", "sessionId": sid, "attempts": attempts }),
                 );
             }
-            if !self.bridge.is_connected() {
+            if !self.runtime_available() {
                 continue;
             }
             loop {
@@ -335,8 +379,7 @@ impl DeviceHub {
                     break;
                 }
                 match self
-                    .bridge
-                    .request("session.startTurn", item.params.clone(), Duration::from_secs(120))
+                    .runtime_call("session.startTurn", item.params.clone(), Duration::from_secs(120))
                     .await
                 {
                     Ok(_) => {
@@ -430,12 +473,15 @@ impl DeviceHub {
     }
 
     /// Приём данных от нативного плагина dsh-phone-bridge (HTTP push вместо
-    /// TCP-моста AA). Плагин шлёт готовые события/сессии/статус - кладём их в
-    /// тот же event-feed, что и bridge-уведомления, поэтому телефон видит их
-    /// одинаково. Статус дополнительно поднимает plugin_connected, чтобы узел
-    /// считался подключённым без Agents Anywhere.
+    /// TCP-моста AA). Плагин шлёт рукопожатие, статус, сессии, события и
+    /// результаты команд - всё кладём в тот же event-feed, что и
+    /// bridge-уведомления, поэтому телефон видит их одинаково.
     pub fn ingest_bridge(&self, kind: &str, data: Value) {
+        // Любой входящий push доказывает живость канала: без этой отметки
+        // plugin_alive() полагался бы только на heartbeat.
+        self.plugin_touch();
         match kind {
+            "hello" => self.plugin_hello(data),
             "status" => {
                 let connected = data.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
                 self.plugin_connected.store(connected, Ordering::Relaxed);
@@ -443,6 +489,19 @@ impl DeviceHub {
                     "bridge",
                     json!({ "status": if connected { "connected" } else { "disconnected" }, "source": "plugin" }),
                 );
+            }
+            "result" => {
+                // id забираем владеющим String: иначе заимствование data не даст
+                // передать его же в plugin_resolve.
+                let id = data
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    return;
+                }
+                self.plugin_resolve(&id, data);
             }
             "sessions" => self.push_event("sessions", data),
             "event" => {
@@ -454,6 +513,192 @@ impl DeviceHub {
                 self.push_event(&t, data);
             }
             _ => {}
+        }
+    }
+
+    // ---------------- нативный плагин: исходящий канал ----------------
+
+    /// Рукопожатие плагина: фиксируем версию/источник и считаем канал живым.
+    pub fn plugin_hello(&self, info: Value) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.plugin_info = Some(info);
+            st.plugin_last_push = now_ts();
+        }
+        self.plugin_connected.store(true, Ordering::Relaxed);
+    }
+
+    /// Отметка живости канала (обновляется на любой входящий push).
+    pub fn plugin_touch(&self) {
+        self.state.lock().unwrap().plugin_last_push = now_ts();
+    }
+
+    /// Жив ли канал плагина: подключён И heartbeat свежее PLUGIN_STALE_SECS.
+    pub fn plugin_alive(&self) -> bool {
+        let connected = self.plugin_connected.load(Ordering::Relaxed);
+        let last = self.state.lock().unwrap().plugin_last_push;
+        Self::plugin_alive_at(connected, last)
+    }
+
+    /// Расчёт живости из уже снятых значений. Отдельная функция потому, что
+    /// `state` - это std-Mutex, он не реентерабелен: вызов plugin_alive() из
+    /// plugin_metrics() (который держит этот лок) вешал и /api/health, и тесты.
+    fn plugin_alive_at(connected: bool, last_push: f64) -> bool {
+        connected && last_push > 0.0 && now_ts() - last_push <= PLUGIN_STALE_SECS
+    }
+
+    /// Подписка на поколение очереди команд (для long-poll плагина).
+    pub fn plugin_gen_rx(&self) -> watch::Receiver<u64> {
+        self.plugin_gen_tx.subscribe()
+    }
+
+    /// Забрать до `limit` команд из очереди. Команды остаются в plugin_pending:
+    /// если плагин не ответит, их снимет таймаут вызывающей стороны.
+    pub fn plugin_take_commands(&self, limit: usize) -> Vec<Value> {
+        let mut st = self.state.lock().unwrap();
+        let n = limit.min(PLUGIN_POLL_BATCH).min(st.plugin_queue.len());
+        (0..n)
+            .filter_map(|_| st.plugin_queue.pop_front())
+            .map(|c| {
+                json!({
+                    "id": c.id,
+                    "method": c.method,
+                    "params": c.params,
+                    "queuedAt": c.queued_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Постановка команды в очередь плагина. Вынесена из plugin_call, чтобы
+    /// лимит очереди и отбраковка старья проверялись тестами синхронно.
+    fn plugin_enqueue(&self, method: &str, params: Value) -> (String, oneshot::Receiver<Value>) {
+        let (tx, rx) = oneshot::channel::<Value>();
+        let seq = self.plugin_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("pc-{seq}");
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.plugin_queue.len() >= PLUGIN_QUEUE_CAP {
+                if let Some(old) = st.plugin_queue.pop_front() {
+                    st.plugin_dropped = st.plugin_dropped.saturating_add(1);
+                    if let Some(old_tx) = st.plugin_pending.remove(&old.id) {
+                        let _ = old_tx.send(json!({
+                            "ok": false,
+                            "error": "dropped: plugin command queue overflow",
+                        }));
+                    }
+                }
+            }
+            st.plugin_pending.insert(id.clone(), tx);
+            st.plugin_queue.push_back(PluginCommand {
+                id: id.clone(),
+                method: method.to_string(),
+                params,
+                queued_at: now_ts(),
+            });
+        }
+        let _ = self.plugin_gen_tx.send(seq);
+        (id, rx)
+    }
+
+    /// Исходящий вызов в плагин: команда кладётся в очередь, плагин забирает её
+    /// long-poll'ом и отвечает через ingest(type="result"). Именно это даёт
+    /// телефону session.list / getState / startTurn без моста Agents Anywhere.
+    pub async fn plugin_call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if !self.plugin_alive() {
+            return Err("plugin bridge offline".to_string());
+        }
+        let (id, rx) = self.plugin_enqueue(method, params);
+        let started = now_ts();
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(v)) => {
+                let rtt = ((now_ts() - started) * 1000.0).round() as u64;
+                self.state.lock().unwrap().plugin_rtt_ms = Some(rtt);
+                if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
+                    let msg = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("plugin error")
+                        .to_string();
+                    return Err(msg);
+                }
+                Ok(v.get("result").cloned().unwrap_or(v))
+            }
+            Ok(Err(_)) => Err("plugin channel closed".to_string()),
+            Err(_) => {
+                self.state.lock().unwrap().plugin_pending.remove(&id);
+                Err(format!(
+                    "plugin timeout after {}s waiting for {method}",
+                    timeout.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// Ответ плагина на команду. false - nobody ждал этот id (таймаут/дубль).
+    pub fn plugin_resolve(&self, id: &str, payload: Value) -> bool {
+        let tx = self.state.lock().unwrap().plugin_pending.remove(id);
+        match tx {
+            Some(tx) => tx.send(payload).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Диапазон/метрики канала плагина для /api/health и дашборда.
+    pub fn plugin_metrics(&self) -> Value {
+        let connected = self.plugin_connected.load(Ordering::Relaxed);
+        let st = self.state.lock().unwrap();
+        let alive = Self::plugin_alive_at(connected, st.plugin_last_push);
+        let info = st.plugin_info.clone().unwrap_or_else(|| json!({}));
+        let age = if st.plugin_last_push > 0.0 {
+            json!((now_ts() - st.plugin_last_push).round())
+        } else {
+            Value::Null
+        };
+        json!({
+            "connected": connected,
+            "alive": alive,
+            "staleAfterSec": PLUGIN_STALE_SECS,
+            "version": info.get("version").cloned().unwrap_or(Value::Null),
+            "source": info.get("source").cloned().unwrap_or(Value::Null),
+            "capabilities": info.get("capabilities").cloned().unwrap_or(Value::Null),
+            "lastPushAgeSec": age,
+            "queue": st.plugin_queue.len(),
+            "inFlight": st.plugin_pending.len(),
+            "dropped": st.plugin_dropped,
+            "rttMs": st.plugin_rtt_ms,
+        })
+    }
+
+    /// Есть ли хоть один канал к рантайму: TCP-мост или нативный плагин.
+    pub fn runtime_available(&self) -> bool {
+        self.bridge.is_connected() || self.plugin_alive()
+    }
+
+    /// Единая точка вызова рантайма. Сначала проверенный TCP-мост; если его нет,
+    /// но живой наш плагин - идём через него. runtime.sync.* плагину не нужны:
+    /// он сам пушит события, поэтому подписка и ack обслуживаются на месте.
+    pub async fn runtime_call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        if self.bridge.is_connected() {
+            return self.bridge.request(method, params, timeout).await;
+        }
+        match method {
+            "runtime.sync.subscribe" => Ok(json!({
+                "streamId": "dsh-phone-plugin",
+                "projectionVersion": 2,
+            })),
+            "runtime.sync.ack" | "runtime.sync.unsubscribe" => Ok(json!({ "ok": true })),
+            _ => self.plugin_call(method, params, timeout).await,
         }
     }
 
@@ -733,7 +978,8 @@ impl DeviceHub {
         let mut reported_dropped: u64 = 0;
         loop {
             tokio::time::sleep(poll).await;
-            if !self.bridge.is_connected() {
+            // Канал может быть любым: TCP-мост AA или наш нативный плагин.
+            if !self.runtime_available() {
                 continue;
             }
             // The notify channel is bounded now, so an overloaded pump loses
@@ -754,7 +1000,7 @@ impl DeviceHub {
             // timeouts could stretch a 1 s interval into minutes.
             let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
             for sid in sids {
-                if !self.bridge.is_connected() {
+                if !self.runtime_available() {
                     break;
                 }
                 while set.len() >= WATCH_POLL_CONCURRENCY {
@@ -773,8 +1019,7 @@ impl DeviceHub {
 
     async fn refresh_sessions(&self) {
         let res = match self
-            .bridge
-            .request("session.list", json!({ "limit": 1000 }), Duration::from_secs(20))
+            .runtime_call("session.list", json!({ "limit": 1000 }), Duration::from_secs(20))
             .await
         {
             Ok(r) => r,
@@ -841,12 +1086,11 @@ impl DeviceHub {
     }
 
     async fn refresh_watched(&self, sid: &str) {
-        if !self.bridge.is_connected() {
+        if !self.runtime_available() {
             return;
         }
         let stv = match self
-            .bridge
-            .request("session.getState", json!({ "sessionId": sid }), Duration::from_secs(15))
+            .runtime_call("session.getState", json!({ "sessionId": sid }), Duration::from_secs(15))
             .await
         {
             Ok(v) => v,
@@ -1123,7 +1367,7 @@ impl Gateway {
             "main".to_string(),
             cfg.token.clone(),
             cfg.connector_id.clone(),
-            cfg.bridge_endpoint_path.clone(),
+            cfg.bridge_endpoint_paths(),
             cfg.event_buffer_max,
             cfg.poll_seconds,
             push.clone(),
@@ -1136,7 +1380,7 @@ impl Gateway {
                 d.name.clone(),
                 d.token.clone(),
                 d.connector_id.clone(),
-                cfg.bridge_endpoint_path.clone(),
+                cfg.bridge_endpoint_paths(),
                 cfg.event_buffer_max,
                 cfg.poll_seconds,
                 push.clone(),
@@ -1165,7 +1409,7 @@ impl Gateway {
 
     pub fn is_bridge_connected(&self) -> bool {
         let h = self.main_hub();
-        h.bridge.is_connected() || h.plugin_connected.load(Ordering::Relaxed)
+        h.bridge.is_connected() || h.plugin_alive()
     }
 
     pub fn device_briefs(&self) -> Vec<DeviceBrief> {
@@ -1176,7 +1420,7 @@ impl Gateway {
                 name: h.name.clone(),
                 token: h.token.clone(),
                 connector_id: h.connector_id.clone(),
-                connected: h.bridge.is_connected() || h.plugin_connected.load(Ordering::Relaxed),
+                connected: h.bridge.is_connected() || h.plugin_alive(),
                 main: i == 0,
             })
             .collect()
@@ -1192,7 +1436,7 @@ mod tests {
             "test".into(),
             "tok".into(),
             "conn".into(),
-            "C:/nonexistent/endpoint.json".into(),
+            vec!["C:/nonexistent/endpoint.json".to_string()],
             64,
             1.0,
             PushRouter::new(),
@@ -1279,6 +1523,185 @@ mod tests {
         let snap = hub.plugin_ping_snapshot().expect("ping stored");
         assert!(snap["hasSession"].as_bool().unwrap());
         assert_eq!(snap["sessionId"].as_str().unwrap(), "session-x");
+    }
+
+    #[test]
+    fn plugin_channel_starts_dead_and_comes_alive_on_hello() {
+        let hub = test_hub();
+        assert!(!hub.plugin_alive(), "без рукопожатия канал обязан быть мёртвым");
+        assert!(!hub.runtime_available());
+        hub.plugin_hello(json!({ "version": 2, "source": "dsh-phone-bridge" }));
+        assert!(hub.plugin_alive());
+        assert!(hub.runtime_available(), "плагин заменяет TCP-мост");
+        let m = hub.plugin_metrics();
+        assert!(m["alive"].as_bool().unwrap());
+        assert_eq!(m["source"].as_str().unwrap(), "dsh-phone-bridge");
+        assert_eq!(m["version"].as_i64().unwrap(), 2);
+        assert_eq!(m["queue"].as_u64().unwrap(), 0);
+        assert_eq!(m["staleAfterSec"].as_f64().unwrap(), PLUGIN_STALE_SECS);
+    }
+
+    #[test]
+    fn plugin_commands_are_taken_in_batches_and_resolved_once() {
+        let hub = test_hub();
+        hub.plugin_hello(json!({}));
+        let mut rxs = Vec::new();
+        for i in 0..10 {
+            let (_id, rx) =
+                hub.plugin_enqueue("session.getState", json!({ "sessionId": format!("s{i}") }));
+            rxs.push(rx);
+        }
+        assert_eq!(hub.plugin_metrics()["queue"].as_u64().unwrap(), 10);
+        let batch = hub.plugin_take_commands(8);
+        assert_eq!(batch.len(), 8, "батч ограничен PLUGIN_POLL_BATCH");
+        assert_eq!(batch[0]["method"].as_str().unwrap(), "session.getState");
+        assert_eq!(
+            batch[0]["params"]["sessionId"].as_str().unwrap(),
+            "s0",
+            "очередь FIFO"
+        );
+        assert_eq!(hub.plugin_take_commands(8).len(), 2);
+        assert!(hub.plugin_take_commands(8).is_empty());
+        let id0 = batch[0]["id"].as_str().unwrap().to_string();
+        assert!(hub.plugin_resolve(
+            &id0,
+            json!({ "ok": true, "result": { "status": "idle" } })
+        ));
+        assert!(
+            !hub.plugin_resolve(&id0, json!({ "ok": true })),
+            "дубль ответа не должен приниматься"
+        );
+        assert_eq!(
+            rxs.remove(0).try_recv().unwrap()["result"]["status"]
+                .as_str()
+                .unwrap(),
+            "idle"
+        );
+    }
+
+    #[test]
+    fn plugin_queue_overflow_drops_the_oldest_command() {
+        let hub = test_hub();
+        hub.plugin_hello(json!({}));
+        let mut first_rx = None;
+        for i in 0..(PLUGIN_QUEUE_CAP + 3) {
+            let (_id, rx) = hub.plugin_enqueue("session.list", json!({ "i": i }));
+            if i == 0 {
+                first_rx = Some(rx);
+            }
+        }
+        let m = hub.plugin_metrics();
+        assert_eq!(m["queue"].as_u64().unwrap(), PLUGIN_QUEUE_CAP as u64);
+        assert_eq!(m["dropped"].as_u64().unwrap(), 3);
+        // старьё отклоняется явной ошибкой, а не теряется молча
+        let v = first_rx
+            .unwrap()
+            .try_recv()
+            .expect("ожидатель отброшенной команды обязан быть разбужен");
+        assert!(!v["ok"].as_bool().unwrap());
+        assert!(v["error"].as_str().unwrap().contains("overflow"));
+    }
+
+    #[tokio::test]
+    async fn plugin_call_offline_without_hello() {
+        let hub = test_hub();
+        let err = hub
+            .plugin_call("session.list", json!({}), Duration::from_millis(50))
+            .await
+            .expect_err("без рукопожатия вызов не проходит");
+        assert_eq!(err, "plugin bridge offline");
+    }
+
+    #[tokio::test]
+    async fn plugin_call_times_out_and_clears_pending() {
+        let hub = test_hub();
+        hub.plugin_hello(json!({}));
+        let err = hub
+            .plugin_call("session.list", json!({}), Duration::from_millis(80))
+            .await
+            .expect_err("без ответа плагина вызов обязан упасть по таймауту");
+        assert!(err.contains("timeout"), "получили: {err}");
+        assert_eq!(
+            hub.plugin_metrics()["inFlight"].as_u64().unwrap(),
+            0,
+            "после таймаута pending обязан быть пуст"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_call_serves_sync_locally_and_routes_the_rest_to_plugin() {
+        let hub = test_hub();
+        hub.plugin_hello(json!({}));
+        // подписка и ack обслуживаются на месте: плагин сам пушит события
+        let sub = hub
+            .runtime_call("runtime.sync.subscribe", json!({}), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(sub["streamId"].as_str().unwrap(), "dsh-phone-plugin");
+        assert_eq!(sub["projectionVersion"].as_i64().unwrap(), 2);
+        let ack = hub
+            .runtime_call("runtime.sync.ack", json!({ "batchSeq": 1 }), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(ack["ok"].as_bool().unwrap());
+
+        // реальный метод уходит в очередь плагина
+        let call = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.runtime_call("session.list", json!({ "limit": 1000 }), Duration::from_secs(10))
+                    .await
+            }
+        });
+        let mut cmds = Vec::new();
+        for _ in 0..400 {
+            cmds = hub.plugin_take_commands(8);
+            if !cmds.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(cmds.len(), 1, "команда должна была встать в очередь");
+        assert_eq!(cmds[0]["method"].as_str().unwrap(), "session.list");
+        let id = cmds[0]["id"].as_str().unwrap().to_string();
+        assert!(hub.plugin_resolve(
+            &id,
+            json!({ "ok": true, "result": { "sessions": [{ "sessionId": "sess_dsh_x" }] } })
+        ));
+        let res = call.await.unwrap().unwrap();
+        assert_eq!(res["sessions"][0]["sessionId"].as_str().unwrap(), "sess_dsh_x");
+    }
+
+    #[tokio::test]
+    async fn ingest_hello_and_result_drive_the_plugin_channel() {
+        let hub = test_hub();
+        hub.ingest_bridge("hello", json!({ "version": 3, "source": "dsh-phone-bridge" }));
+        assert!(hub.plugin_alive(), "hello через ingest поднимает канал");
+        let call = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.plugin_call("session.getState", json!({ "sessionId": "s1" }), Duration::from_secs(10))
+                    .await
+            }
+        });
+        let mut id = String::new();
+        for _ in 0..400 {
+            if let Some(c) = hub.plugin_take_commands(8).first().cloned() {
+                id = c["id"].as_str().unwrap().to_string();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!id.is_empty(), "команда не появилась в очереди");
+        hub.ingest_bridge(
+            "result",
+            json!({ "id": id, "ok": true, "result": { "status": "working" } }),
+        );
+        let res = call.await.unwrap().unwrap();
+        assert_eq!(res["status"].as_str().unwrap(), "working");
+        let m = hub.plugin_metrics();
+        assert!(m["lastPushAgeSec"].as_f64().unwrap() < 10.0);
+        assert!(m["rttMs"].as_u64().is_some(), "замер RTT сохранён");
     }
 
     #[test]

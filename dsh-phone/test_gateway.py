@@ -567,5 +567,43 @@ class TestDraftSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(clears), 1)
 
 
+class TestBridgeEndpointPaths(unittest.TestCase):
+    """Порядок кандидатов обязан совпадать с Rust-узлом (config.rs)."""
+
+    def test_plugin_endpoint_comes_first(self):
+        cfg = {
+            "pluginBridgeEndpointPath": "/home/u/.dsh/dsh-phone/bridge/endpoint.json",
+            "bridgeEndpointPath": "/home/u/.dsh/agents-anywhere/bridge/endpoint.json",
+        }
+        paths = gw.bridge_endpoint_paths(cfg)
+        self.assertEqual(len(paths), 2)
+        self.assertIn("dsh-phone", paths[0])
+        self.assertIn("agents-anywhere", paths[1])
+
+    def test_blank_and_duplicate_paths_are_dropped(self):
+        cfg = {"pluginBridgeEndpointPath": "   ", "bridgeEndpointPath": "/a/endpoint.json"}
+        self.assertEqual(gw.bridge_endpoint_paths(cfg), ["/a/endpoint.json"])
+        same = {
+            "pluginBridgeEndpointPath": "/a/endpoint.json",
+            "bridgeEndpointPath": "/a/endpoint.json",
+        }
+        self.assertEqual(gw.bridge_endpoint_paths(same), ["/a/endpoint.json"])
+
+    def test_missing_keys_do_not_crash(self):
+        self.assertEqual(gw.bridge_endpoint_paths({}), [])
+
+    def test_defaults_point_at_plugin_then_aa(self):
+        paths = gw.bridge_endpoint_paths(gw.DEFAULT_CONFIG)
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(
+            paths[0].replace("\\", "/").endswith("/dsh-phone/bridge/endpoint.json"),
+            paths[0],
+        )
+        self.assertTrue(
+            paths[1].replace("\\", "/").endswith("/agents-anywhere/bridge/endpoint.json"),
+            paths[1],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

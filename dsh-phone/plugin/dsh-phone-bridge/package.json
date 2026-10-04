@@ -1,9 +1,12 @@
 {
   "name": "dsh-phone-bridge",
   "version": "0.4.0",
-  "description": "Native DSH bridge plugin: pushes sessions, events and bridge status from DSH Desktop straight to the dsh-phone node over HTTP (127.0.0.1:8460), removing the dependency on the Agents Anywhere bridge (endpoint.json + TCP JSON-RPC). Browser half sniffs the desktop's own session/event traffic and forwards it; the node ingests it via /api/bridge/ingest.",
+  "description": "Native DSH bridge plugin. Host half: a loopback TCP JSON-RPC bridge (127.0.0.1, random port, <DSH_HOME>/dsh-phone/bridge/endpoint.json) that is wire-compatible with the Agents Anywhere bridge, so the dsh-phone Rust node gets sessions, history, live sync, sending and interrupts without AA installed. Browser half: sniffs the desktop's own session/event traffic and pushes it to the node over HTTP (127.0.0.1:8460) via /api/bridge/ingest.",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",

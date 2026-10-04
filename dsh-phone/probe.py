@@ -1,8 +1,17 @@
 import asyncio, json, os, sys
 
-ENDPOINT = os.path.expanduser("~/.dsh/agents-anywhere/bridge/endpoint.json")
+# Кандидаты в том же порядке, что и в узле: сначала наш плагин dsh-phone-bridge,
+# затем мост Agents Anywhere. DSH_BRIDGE_ENDPOINT переопределяет выбор вручную.
+CANDIDATES = [
+    os.path.expanduser("~/.dsh/dsh-phone/bridge/endpoint.json"),
+    os.path.expanduser("~/.dsh/agents-anywhere/bridge/endpoint.json"),
+]
+ENDPOINT = os.environ.get("DSH_BRIDGE_ENDPOINT") or next(
+    (p for p in CANDIDATES if os.path.exists(p)), CANDIDATES[0]
+)
 
 async def main():
+    print("endpoint file:", ENDPOINT)
     ep = json.load(open(ENDPOINT, encoding="utf-8"))
     print("endpoint:", ep["host"], ep["port"], "pid", ep.get("pid"))
     reader, writer = await asyncio.open_connection(ep["host"], ep["port"])

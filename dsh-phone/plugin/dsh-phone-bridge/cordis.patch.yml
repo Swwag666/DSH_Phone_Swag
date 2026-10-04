@@ -1,8 +1,17 @@
-# dsh-phone-bridge bundle patch: inserts the native bridge plugin row into the
-# web plugin roster. Node half is a no-op placeholder (the whole engine lives in
-# the browser half); the dsh.client declaration in package.json makes
-# dsh-client-modules serve lib/client.js under /plugins and add it to
-# __DSH_BOOT__, where the browser cordis Loader materializes and activates it.
+# dsh-phone-bridge bundle patch: вставляет ряд плагина в ростер cordis.
+#
+# Ровно тот же механизм, которым Desktop подключает мост Agents Anywhere
+# (`id` + `name` пакета), поэтому один и тот же ряд даёт две половины:
+#   * host-половина (main -> lib/index.js): ctx.plugin(DshPhoneBridgeService)
+#     поднимает TCP-мост на 127.0.0.1 и пишет
+#     <DSH_HOME>/dsh-phone/bridge/endpoint.json;
+#   * web-половина (dsh.client.platform: web -> exports["./client"]):
+#     dsh-client-modules отдаёт lib/client.js в /plugins и добавляет его в
+#     __DSH_BOOT__, где браузерный Loader его материализует.
+#
+# config намеренно пустой: Desktop inject-ит dshHome только ряду AA, поэтому наш
+# сервис сам резолвит DSH_HOME (process.env.DSH_HOME либо ~/.dsh).
 - insert:
     - id: dsh-phone-bridge
       name: dsh-phone-bridge
+      config: {}

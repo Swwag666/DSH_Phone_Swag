@@ -2,6 +2,23 @@
 const LS = "dsh-phone-token";
 let token = localStorage.getItem(LS) || "";
 let bridgeOn = false;
+// Какой канал сейчас в работе: "tcp" (мост плагина или AA), "plugin" (HTTP-канал
+// web-половины) или "" (не знаем/нет). Показывается в тултипе точки статуса.
+let bridgeChannel = "";
+
+function bridgeChannelLabel() {
+  if (!bridgeOn) return "мост отключён";
+  if (bridgeChannel === "plugin") return "мост: плагин dsh-phone (HTTP)";
+  if (bridgeChannel === "tcp") return "мост: TCP (DSH Desktop)";
+  return "мост подключён";
+}
+
+function paintBridge() {
+  const dot = $("status-dot");
+  if (!dot) return;
+  dot.className = "dot " + (bridgeOn ? "on" : "off");
+  dot.title = bridgeChannelLabel();
+}
 let sessions = [];
 let activeSession = null;
 let items = new Map();       // key -> item
@@ -730,7 +747,7 @@ function applyState(st) {
   if (st.selections && st.selections.model) currentModelId = st.selections.model;
   if (st.selections && st.selections.permission) currentPermissionId = st.selections.permission;
   const working = isWorking(knownStatus);
-  $("status-dot").className = "dot " + (bridgeOn ? "on" : "off");
+  paintBridge();
   $("send").disabled = false;
   $("interrupt").style.display = working ? "" : "none";
   let meta = "";
@@ -1708,7 +1725,12 @@ document.addEventListener("click", (e) => {
 
 // ---------- events long-poll ----------
 function processEvent(ev) {
-  if (ev.type === "bridge") { bridgeOn = ev.data.status === "connected"; $("status-dot").className = "dot " + (bridgeOn ? "on" : "off"); }
+  if (ev.type === "bridge") {
+    bridgeOn = ev.data.status === "connected";
+    // push от web-половины плагина помечен source:"plugin"; остальное - TCP-мост
+    bridgeChannel = !bridgeOn ? "" : (ev.data.source === "plugin" ? "plugin" : "tcp");
+    paintBridge();
+  }
   else if (ev.type === "sessions") { sessions = ev.data.sessions || []; renderSessions(); }
   else if (ev.type === "state" && ev.data.sessionId === activeSession) { applyState(ev.data.state); }
   else if (ev.type === "draft") { applyRemoteDraft(ev.data); }
@@ -1884,7 +1906,8 @@ async function boot() {
   if (cs && cs.length) { sessions = cs; renderSessions(); }
   const h = await fetch("/api/health").then((r) => r.json()).catch(() => ({ ok: false, bridge: "disconnected" }));
   bridgeOn = h.bridge === "connected";
-  $("status-dot").className = "dot " + (bridgeOn ? "on" : "off");
+  bridgeChannel = h.bridgeChannel || (h.pluginBridge && h.pluginBridge.alive ? "plugin" : "");
+  paintBridge();
   if (token) {
     const ok = await tryAuth(token);
     if (ok) return;

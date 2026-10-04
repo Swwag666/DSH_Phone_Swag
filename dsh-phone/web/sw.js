@@ -2,7 +2,7 @@
 // "?v=N" query; this SW normalizes that query away when reading/writing the
 // cache, so a version bump in HTML does not cause offline cache misses.
 // The cache name itself is still versioned so activate can evict old entries (S1).
-const APP_VERSION = "21";
+const APP_VERSION = "22";
 const CACHE = "dsh-phone-v" + APP_VERSION;
 // Canonical (unversioned) precache list - cached under these exact paths.
 const ASSETS = ["/", "/app.js", "/md.js", "/itemrender.js", "/draftsync.js", "/style.css", "/manifest.json", "/icon.svg"];
