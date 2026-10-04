@@ -953,6 +953,152 @@ export default function App() {
                 {t("note")}
               </div>
             </section>
+
+            {/* QR + уведомления: отдельный блок в левой колонке */}
+            <section className="panel rounded-md p-5 fade-up">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="text-[16px] font-semibold text-bone">{t("qr")}</h2>
+                  <div className="text-[11.5px] text-ash mt-0.5">{t("qrHint")}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={refreshQr}
+                  className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
+                >
+                  {t("qrRefresh")}
+                </button>
+              </div>
+              <div className="mt-3 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                {qr ? (
+                  <>
+                    <div className="flex gap-4 items-start">
+                      {/* data-URI в <img>, а не innerHTML: браузер не исполняет
+                          скрипты из SVG по ссылке, так что разметка кода не
+                          может стать вектором даже если адрес подменён */}
+                      <img
+                        src={"data:image/svg+xml;utf8," + encodeURIComponent(qr.svg)}
+                        alt={qr.address}
+                        width={188}
+                        height={188}
+                        className="shrink-0 rounded-sm bg-bone p-1.5"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-[11.5px] text-bone break-all">{qr.address}</div>
+                        <div className="text-[11px] text-ash mt-2 leading-relaxed">{t("qrHowto")}</div>
+                        {!cfg?.tls_enabled && (
+                          <div className="text-[11px] text-ember mt-2 leading-relaxed">{t("qrWarnPlain")}</div>
+                        )}
+                        {qr.address !== url + "/" && (
+                          <div className="text-[11px] text-ember mt-2">{t("qrStale")}</div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-3 flex items-center gap-2">
+                      <input
+                        ref={qrUrlRef}
+                        readOnly
+                        value={qr.url}
+                        onFocus={(e) => e.currentTarget.select()}
+                        className="flex-1 min-w-0 bg-ink border border-edge rounded-sm px-2.5 py-1.5 text-[11px] text-ash font-mono"
+                        aria-label={t("qrCopy")}
+                      />
+                      <button
+                        type="button"
+                        onClick={onCopyQrUrl}
+                        className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
+                      >
+                        {t("qrCopy")}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="text-[11.5px] text-ember">{t("qrFailed")}</div>
+                )}
+              </div>
+
+              {/* уведомления */}
+              <div className="mt-5 border-t border-edge pt-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <h2 className="text-[16px] font-semibold text-bone">{t("push")}</h2>
+                    <div className="text-[11.5px] text-ash mt-0.5">{t("pushHint")}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onPushTest}
+                    disabled={pushBusy}
+                    className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-blood border border-blood/40 hover:bg-blood/10 transition disabled:opacity-40"
+                  >
+                    {t("pushTest")}
+                  </button>
+                </div>
+                <div className="mt-3 rounded-sm border border-edge bg-ink/55 px-4 py-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-[11.5px] text-ash">
+                      {t("webPush")}:{" "}
+                      <span className="text-bone mono-badge">{push?.subscriptions ?? 0}</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onPushClear}
+                      disabled={(push?.subscriptions ?? 0) === 0}
+                      className="px-2 py-0.5 rounded-sm text-[10.5px] text-ash hover:text-blood border border-edge transition disabled:opacity-40"
+                    >
+                      {t("pushClear")}
+                    </button>
+                  </div>
+                  <div className="mt-1 text-[11px] text-ash/80">{t("webPushHint")}</div>
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[13px] text-bone">{t("ntfyLbl")}</div>
+                    <div className="text-[11.5px] text-ash">{t("ntfyHint")}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onToggleNtfy}
+                    className={"toggle" + (push?.ntfy_enabled ? " on" : "")}
+                    aria-pressed={!!push?.ntfy_enabled}
+                  >
+                    <span className="knob" />
+                  </button>
+                </div>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <input
+                    value={ntfyUrl}
+                    onChange={(e) => setNtfyUrl(e.target.value)}
+                    placeholder={t("ntfyUrlPh")}
+                    spellCheck={false}
+                    className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                  />
+                  <input
+                    value={ntfyTopic}
+                    onChange={(e) => setNtfyTopic(e.target.value)}
+                    placeholder={t("ntfyTopicPh")}
+                    spellCheck={false}
+                    className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                  />
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <input
+                    value={ntfyToken}
+                    onChange={(e) => setNtfyToken(e.target.value)}
+                    placeholder={t("ntfyTokenPh")}
+                    spellCheck={false}
+                    type="password"
+                    className="flex-1 min-w-0 bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
+                  />
+                  <button
+                    type="button"
+                    onClick={onSaveNtfy}
+                    className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
+                  >
+                    {t("ntfyApply")}
+                  </button>
+                </div>
+              </div>
+            </section>
           </div>
 
           {/* right column */}
@@ -1212,68 +1358,6 @@ export default function App() {
                 <div className="py-2.5 border-t border-edge">
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="text-[13px] text-bone">{t("qr")}</div>
-                      <div className="text-[11.5px] text-ash">{t("qrHint")}</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={refreshQr}
-                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
-                    >
-                      {t("qrRefresh")}
-                    </button>
-                  </div>
-                  <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
-                    {qr ? (
-                      <>
-                        <div className="flex gap-4 items-start">
-                          {/* data-URI в <img>, а не innerHTML: браузер не исполняет
-                              скрипты из SVG по ссылке, так что разметка кода не
-                              может стать вектором даже если адрес подменён */}
-                          <img
-                            src={"data:image/svg+xml;utf8," + encodeURIComponent(qr.svg)}
-                            alt={qr.address}
-                            width={188}
-                            height={188}
-                            className="shrink-0 rounded-sm bg-bone p-1.5"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="text-[11.5px] text-bone break-all">{qr.address}</div>
-                            <div className="text-[11px] text-ash mt-2 leading-relaxed">{t("qrHowto")}</div>
-                            {!cfg?.tls_enabled && (
-                              <div className="text-[11px] text-ember mt-2 leading-relaxed">{t("qrWarnPlain")}</div>
-                            )}
-                            {qr.address !== url + "/" && (
-                              <div className="text-[11px] text-ember mt-2">{t("qrStale")}</div>
-                            )}
-                          </div>
-                        </div>
-                        <div className="mt-3 flex items-center gap-2">
-                          <input
-                            ref={qrUrlRef}
-                            readOnly
-                            value={qr.url}
-                            onFocus={(e) => e.currentTarget.select()}
-                            className="flex-1 min-w-0 bg-ink border border-edge rounded-sm px-2.5 py-1.5 text-[11px] text-ash font-mono"
-                            aria-label={t("qrCopy")}
-                          />
-                          <button
-                            type="button"
-                            onClick={onCopyQrUrl}
-                            className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-bone border border-edge hover:bg-rise/40 transition"
-                          >
-                            {t("qrCopy")}
-                          </button>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="text-[11.5px] text-ember">{t("qrFailed")}</div>
-                    )}
-                  </div>
-                </div>
-                <div className="py-2.5 border-t border-edge">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
                       <div className="text-[13px] text-bone">{t("upd")}</div>
                       <div className="text-[11.5px] text-ash">{t("updHint")}</div>
                     </div>
@@ -1334,86 +1418,6 @@ export default function App() {
                       )}
                     </div>
                   )}
-                </div>
-                <div className="py-2.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-[13px] text-bone">{t("push")}</div>
-                      <div className="text-[11.5px] text-ash">{t("pushHint")}</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onPushTest}
-                      disabled={pushBusy}
-                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-blood border border-blood/40 hover:bg-blood/10 transition disabled:opacity-40"
-                    >
-                      {t("pushTest")}
-                    </button>
-                  </div>
-                  <div className="mt-2 rounded-sm border border-edge bg-ink/55 px-4 py-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-[11.5px] text-ash">
-                        {t("webPush")}:{" "}
-                        <span className="text-bone mono-badge">{push?.subscriptions ?? 0}</span>
-                      </span>
-                      <button
-                        type="button"
-                        onClick={onPushClear}
-                        disabled={(push?.subscriptions ?? 0) === 0}
-                        className="px-2 py-0.5 rounded-sm text-[10.5px] text-ash hover:text-blood border border-edge transition disabled:opacity-40"
-                      >
-                        {t("pushClear")}
-                      </button>
-                    </div>
-                    <div className="mt-1 text-[11px] text-ash/80">{t("webPushHint")}</div>
-                  </div>
-                  <div className="mt-2.5 flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-[13px] text-bone">{t("ntfyLbl")}</div>
-                      <div className="text-[11.5px] text-ash">{t("ntfyHint")}</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onToggleNtfy}
-                      className={"toggle" + (push?.ntfy_enabled ? " on" : "")}
-                      aria-pressed={!!push?.ntfy_enabled}
-                    >
-                      <span className="knob" />
-                    </button>
-                  </div>
-                  <div className="mt-2 grid grid-cols-2 gap-2">
-                    <input
-                      value={ntfyUrl}
-                      onChange={(e) => setNtfyUrl(e.target.value)}
-                      placeholder={t("ntfyUrlPh")}
-                      spellCheck={false}
-                      className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
-                    />
-                    <input
-                      value={ntfyTopic}
-                      onChange={(e) => setNtfyTopic(e.target.value)}
-                      placeholder={t("ntfyTopicPh")}
-                      spellCheck={false}
-                      className="bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
-                    />
-                  </div>
-                  <div className="mt-2 flex items-center gap-2">
-                    <input
-                      value={ntfyToken}
-                      onChange={(e) => setNtfyToken(e.target.value)}
-                      placeholder={t("ntfyTokenPh")}
-                      spellCheck={false}
-                      type="password"
-                      className="flex-1 min-w-0 bg-ink/55 border border-edge rounded-sm px-3 py-1.5 text-[12px] text-bone outline-none focus:border-moss/50 placeholder:text-ash/60 transition"
-                    />
-                    <button
-                      type="button"
-                      onClick={onSaveNtfy}
-                      className="shrink-0 px-3 py-1.5 rounded-sm text-[12px] text-moss border border-moss/40 hover:bg-moss/10 transition"
-                    >
-                      {t("ntfyApply")}
-                    </button>
-                  </div>
                 </div>
                 <div className="py-2.5">
                   <div className="text-[13px] text-bone mb-0.5">{t("allowlist")}</div>
