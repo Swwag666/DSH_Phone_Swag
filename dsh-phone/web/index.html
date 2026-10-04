@@ -8,8 +8,13 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="DSH" />
   <title>DSH PHONE</title>
-  <link rel="manifest" href="/manifest.json?v=19" />
-  <link rel="stylesheet" href="/style.css?v=19" />
+  <link rel="manifest" href="/manifest.json?v=21" />
+  <link rel="stylesheet" href="/style.css?v=21" />
+  <style>
+    #prompt-templates { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 2px; }
+    .tpl-chip { background: #1a1826; color: #cfcec6; border: 1px solid #2e2b3d; border-radius: 14px; padding: 5px 11px; font-size: 12px; line-height: 1.2; cursor: pointer; font-family: inherit; }
+    .tpl-chip:active { background: #2a2738; }
+  </style>
 </head>
 <body>
   <div id="app">
@@ -132,6 +137,14 @@
       <div class="sheet-sec">Фишки</div>
       <div class="pick" id="menu-crt"><span>Экран-плёнка (CRT)</span><span id="crt-state">выкл</span></div>
       <div class="pick" id="menu-push"><span>Пуши · узел шлёт сам</span><span id="push-state">…</span></div>
+      <div class="sheet-sec">Быстрые команды</div>
+      <div id="prompt-templates">
+        <button type="button" class="tpl-chip" data-tpl="Объясни этот код простыми словами">объясни</button>
+        <button type="button" class="tpl-chip" data-tpl="Найди и исправь ошибки в этом коде">исправь</button>
+        <button type="button" class="tpl-chip" data-tpl="Напиши тесты для этого кода">тесты</button>
+        <button type="button" class="tpl-chip" data-tpl="Сделай коммит с понятным сообщением">коммит</button>
+        <button type="button" class="tpl-chip" data-tpl="Продолжай с того места, где остановился">продолжай</button>
+      </div>
       <div class="sheet-sec">Действия</div>
       <button class="pick menu-act" id="menu-reload">Перезагрузить узел</button>
       <button class="pick menu-act" id="menu-export-md">Выгрузить чат · Markdown</button>
@@ -144,10 +157,10 @@
   <div class="scanlines"></div>
   <div class="crt-sweep"></div>
 
-  <script src="/md.js?v=19"></script>
-  <script src="/itemrender.js?v=19"></script>
-  <script src="/draftsync.js?v=19"></script>
-  <script src="/app.js?v=19"></script>
+  <script src="/md.js?v=21"></script>
+  <script src="/itemrender.js?v=21"></script>
+  <script src="/draftsync.js?v=21"></script>
+  <script src="/app.js?v=21"></script>
   <script>
     (function () {
       var $ = function (id) { return document.getElementById(id); };
@@ -199,8 +212,55 @@
 
       $("menu-reload").onclick = function () { location.reload(); };
       $("menu-wipe").onclick = function () {
-        localStorage.removeItem("dsh-phone-token");
-        location.reload();
+        // Полное стирание, а не только токен: иначе «стереть ключ» оставляет
+        // push-подписку на узле, SW-кэши, IndexedDB-черновики и прочие dsh-*
+        // ключи. Собираем задачи и грузимся только когда всё отработает.
+        var tasks = [];
+        var guard = function (fn) { try { var r = fn(); if (r && r.then) tasks.push(r); } catch (e) {} };
+        // push: снять подписку с узла (если app.js экспортировал хелпер)
+        guard(function () { return window.dshDisablePush && window.dshDisablePush(); });
+        // service worker:.unregister все регистрации
+        guard(function () {
+          return navigator.serviceWorker && navigator.serviceWorker.getRegistrations
+            ? navigator.serviceWorker.getRegistrations().then(function (rs) {
+                return Promise.all(rs.map(function (r) { return r.unregister(); }));
+              })
+            : null;
+        });
+        // кэши: удалить все
+        guard(function () {
+          return window.caches && caches.keys
+            ? caches.keys().then(function (ks) {
+                return Promise.all(ks.map(function (k) { return caches.delete(k); }));
+              })
+            : null;
+        });
+        // IndexedDB: удалить все базы (черновики, сообщения)
+        guard(function () {
+          if (!window.indexedDB) return null;
+          var del = function (name) {
+            return new Promise(function (res) {
+              var rq = indexedDB.deleteDatabase(name);
+              rq.onsuccess = res; rq.onerror = res; rq.onblocked = res;
+            });
+          };
+          return indexedDB.databases
+            ? indexedDB.databases().then(function (dbs) {
+                return Promise.all(dbs.filter(function (d) { return d.name; }).map(function (d) { return del(d.name); }));
+              })
+            : del("dsh-phone");
+        });
+        // localStorage: все ключи, начинающиеся на dsh
+        guard(function () {
+          Object.keys(localStorage).forEach(function (k) {
+            if (k.indexOf("dsh") === 0) localStorage.removeItem(k);
+          });
+          return null;
+        });
+        var done = function () { location.reload(); };
+        // грузимся когда всё осело, но не позже 3с (страховка от зависшего deleteDatabase)
+        Promise.allSettled(tasks).then(done, done);
+        setTimeout(done, 3000);
       };
     })();
   </script>

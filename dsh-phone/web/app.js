@@ -1675,6 +1675,37 @@ if ($("menu-push")) {
   $("menu-push").onclick = () => { if (pushSub) disablePush(); else enablePush(); };
 }
 
+// Экспортируем снятие подписки, чтобы «Стереть ключ доступа» в index.html мог
+// удалить push-эндпоинт с узла, а не только локальные данные.
+window.dshDisablePush = disablePush;
+
+// S5: sw.js на клик по уведомлению постит {type:"dsh-open-session",sessionId}.
+// Открываем нужную сессию, чтобы тап по пушу вёл в диалог, а не на главную.
+if (navigator.serviceWorker) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    const d = (e && e.data) || {};
+    if (d.type !== "dsh-open-session" || !d.sessionId) return;
+    const s = (typeof sessions !== "undefined" && sessions || []).find((x) => x && x.sessionId === d.sessionId);
+    if (s) openChat(s);
+  });
+}
+
+// Быстрые шаблоны промптов: клик по чипу дописывает текст в поле ввода и
+// закрывает меню. Делегирование на document — чипы живут в menu-sheet.
+document.addEventListener("click", (e) => {
+  const chip = e.target.closest && e.target.closest(".tpl-chip");
+  if (!chip) return;
+  const tpl = chip.getAttribute("data-tpl") || "";
+  const inp = $("input");
+  if (inp && tpl) {
+    inp.value = inp.value.trim() ? inp.value.replace(/\s+$/, "") + " " + tpl : tpl;
+    if (typeof autoGrow === "function") autoGrow();
+    inp.focus();
+  }
+  const menu = $("menu-sheet");
+  if (menu) menu.classList.add("hidden");
+});
+
 // ---------- events long-poll ----------
 function processEvent(ev) {
   if (ev.type === "bridge") { bridgeOn = ev.data.status === "connected"; $("status-dot").className = "dot " + (bridgeOn ? "on" : "off"); }

@@ -116,7 +116,18 @@ if ($setup -and $setup.Name -notlike "*$ver*") {
     Write-Warning "найден сетап $($setup.Name), а версия в конфиге $ver - проверь, что сборка свежая"
 }
 
-if ($exe) { Copy-Item $exe.FullName (Join-Path $rel 'dsh-phone.exe') -Force }
+if ($exe) {
+    Copy-Item $exe.FullName (Join-Path $rel 'dsh-phone.exe') -Force
+    # Корневой dsh-phone.exe - тот, что пользователь открывает напрямую, поэтому
+    # держим его свежим. Если приложение сейчас запущено, файл занят: не роняем
+    # сборку, а предупреждаем (закрой приложение и пересобери).
+    try {
+        Copy-Item $exe.FullName (Join-Path $root 'dsh-phone.exe') -Force -ErrorAction Stop
+        Write-Host 'корневой dsh-phone.exe обновлён' -ForegroundColor Green
+    } catch {
+        Write-Warning "корневой dsh-phone.exe не обновлён (занят?): $($_.Exception.Message)"
+    }
+}
 if ($setup) {
     Copy-Item $setup.FullName (Join-Path $rel 'dsh-phone-setup.exe') -Force
     Write-Host "в releases уехал: $($setup.Name)" -ForegroundColor Green
