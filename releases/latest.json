@@ -1,0 +1,11 @@
+﻿{
+    "version":  "0.4.0",
+    "notes":  "Экспорт чата в Markdown/JSON, быстрые шаблоны промптов, полная очистка данных («Стереть ключ»), тап по пушу открывает сессию, фиксы утечек памяти и стабильности узла (TLS ring-only, bounded-каналы, byte-budget событий).",
+    "pub_date":  "2026-10-04T06:12:58Z",
+    "platforms":  {
+                      "windows-x86_64":  {
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSVzkvd2JRemJ4aUZYb0FURG4wdVBUcXZSVjdOcGhrTlRRQVJxRXdHUkFHbjhIR1RIWFNqcmRBRkdjZ0F4U0JPVlJKNDI4ZWZnTjBzMWk4aGM4MTlqaVpVbExZMW1NaXdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMDk0MDk0CWZpbGU6RFNIIFBob25lXzAuNC4wX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjQuMApESlhxUUc1MXBKOE50NENEOFBmNExpMU5pbEdBcVVmZWdHY2VHT2FaZjVKdkxqbW9zTDJ0cGpXamJmT0dyQ2E5ekJGd2wxWjE5cVdHdVJzZWc0YmtBZz09Cg==",
+                                             "url":  "https://github.com/Swwag666/DSH_Phone_Swag/releases/download/v0.4.0/dsh-phone-setup.exe"
+                                         }
+                  }
+}
