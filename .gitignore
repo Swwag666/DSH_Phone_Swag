@@ -33,3 +33,6 @@ __pycache__/
 
 # private session dumps / scratch
 tmp/
+
+# распакованный сторонний инструмент (изучался локально, в репо не нужен)
+voidsearch/

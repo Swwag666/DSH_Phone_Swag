@@ -48,7 +48,11 @@ struct HubState {
     sessions: Vec<Value>,
     sessions_hash: String,
     watched: HashMap<String, Watched>,
-    candidates: HashMap<String, Value>,
+    /// Сессии, замеченные в session.inventory.complete, но ещё не пришедшие в
+    /// session.list. Храним (payload, время_вставки): запись живёт максимум час
+    /// и удаляется, как только сессия реально появляется в списке - иначе список
+    /// обрастал призраками навсегда (раньше удалений не было вовсе).
+    candidates: HashMap<String, (Value, f64)>,
     /// Input-field drafts shared between phone/web clients:
     /// sessionId -> {text, origin, ts}
     drafts: HashMap<String, DraftEntry>,
@@ -508,11 +512,14 @@ impl DeviceHub {
             })
             .collect();
         {
-            let st = self.state.lock().unwrap();
-            for (sid, c) in &st.candidates {
-                if have.contains(sid) {
-                    continue;
-                }
+            let mut st = self.state.lock().unwrap();
+            // Вычищаем протухшие (старше часа) и те, что уже реально пришли в
+            // session.list. Без этого candidates только росли, дописываясь в
+            // sessions/sessions_hash и событие "sessions" на каждом poll.
+            let cutoff = now_ts() - 3600.0;
+            st.candidates
+                .retain(|sid, (_, ts)| *ts > cutoff && !have.contains(sid));
+            for (sid, (c, _)) in &st.candidates {
                 let ss = c.get("sourceState").cloned().unwrap_or(Value::Null);
                 sessions.push(json!({
                     "sessionId": sid,
@@ -701,7 +708,7 @@ impl DeviceHub {
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_string())
                                         {
-                                            st.candidates.insert(id, c);
+                                            st.candidates.insert(id, (c, now_ts()));
                                         }
                                     }
                                     refresh = true;

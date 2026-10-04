@@ -1,10 +1,10 @@
 {
     "version":  "0.3.0",
     "notes":  "локальная сборка 0.3.0",
-    "pub_date":  "2026-10-03T18:35:15Z",
+    "pub_date":  "2026-10-04T04:30:13Z",
     "platforms":  {
                       "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSVzkvd2JRemJ4aUxBajloRWp1T3NqM1dqY2dLMXVxSVBzd3FlWC9pZEpWK1k3YXR6SCtLNjM2bGJqQUIvRVdpbC91Yitjc0paVWd1a3k5Z2dQdzdjazJObmhYTk5wTWdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMDUyNTE1CWZpbGU6RFNIIFBob25lXzAuMy4wX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMAozekljRWVvcUN6UEc5OUxTOStlREt0SEs4UXVTSmJCVTRUeGMxYWZ2TTlWNjd2d01JVkdpbUJxbE9WdWJKWE1IVUhzYnNobHowMEYwMm5CMVFXSWlEUT09Cg==",
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSVzkvd2JRemJ4aUc2T0c2WkNjc2kzdTBTbzhVeXV2TXpVc1BFeWdIQzJjNUdkZDZUU3VHQ2tQMldieEdvSTlhdndtbjRxYklqbW5zemxQK1YxblBkMTlrejlwYXhLZlFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMDg4MjEyCWZpbGU6RFNIIFBob25lXzAuMy4wX3g2NC1zZXR1cC5leGUJdmVyc2lvbjowLjMuMApHeGp3V3pBMFlKUW1tazB6cVZYaldRenRySVBzOFBZUHNOUE1vVXBUVys3WFZOSTB5dnlsWUpURjJWdWJIdjlFUHlzZThvdEYrUDFvcUxCaEhlYVZDQT09Cg==",
                                              "url":  "https://example.invalid/DSH-Phone_0.3.0_x64-setup.exe"
                                          }
                   }

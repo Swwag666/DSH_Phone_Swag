@@ -368,8 +368,27 @@ impl PushRouter {
     pub fn add_subscription(&self, sub: PushSubscription) {
         let _g = CONFIG_LOCK.lock().unwrap();
         let mut c = crate::config::AppConfig::load_or_init();
-        c.push_subscriptions.retain(|s| s.endpoint != sub.endpoint);
+        // Дедуп по endpoint + TTL + жёсткий cap. Браузер ротит подписку
+        // (pushsubscriptionchange каждый раз даёт новый endpoint), а единственный
+        // прежний prune срабатывал лишь при реальной отправке на 404/410 - поэтому
+        // мёртвые endpoint'ы копились в config.json навсегда, и файл рос на каждую
+        // операцию (add/remove/dispatch перечитывают и перезаписывают его целиком).
+        // created_at раньше только писался и нигде не читался - теперь это TTL.
+        const MAX_SUBS: usize = 32;
+        const SUB_TTL_SECS: f64 = 30.0 * 86400.0;
+        let now = crate::gateway::now_ts();
+        c.push_subscriptions
+            .retain(|s| s.endpoint != sub.endpoint && (now - s.created_at) < SUB_TTL_SECS);
         c.push_subscriptions.push(sub);
+        if c.push_subscriptions.len() > MAX_SUBS {
+            c.push_subscriptions.sort_by(|a, b| {
+                a.created_at
+                    .partial_cmp(&b.created_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let cut = c.push_subscriptions.len() - MAX_SUBS;
+            c.push_subscriptions.drain(0..cut);
+        }
         let _ = c.save();
     }
 
@@ -389,6 +408,14 @@ fn reqwest_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Urgency для web-push. Сравниваем по машинному tag ("appr-{sid}", формируется
+/// в gateway.rs), а не по человекочитаемому заголовку: заголовок однажды уехал в
+/// mojibake (cp1251->utf8) и contains() перестал матчиться, из-за чего ВСЕ
+/// уведомления уходили с Urgency: normal и «нужен твой ответ» не будил экран.
+fn urgency_for(notice: &Notice) -> &'static str {
+    if notice.tag.starts_with("appr-") { "high" } else { "normal" }
+}
+
 async fn web_push_send(
     vapid: &VapidKeys,
     sub: &PushSubscription,
@@ -399,7 +426,7 @@ async fn web_push_send(
     let body = encrypt_payload(sub, &notice.json())?;
     let auth = vapid_auth_header(vapid, &sub.endpoint)?;
     let ttl = if notice.session_id.is_some() { 3600u64 } else { 600 };
-    let urgency = if notice.title.contains("РѕС‚РІРµС‚") { "high" } else { "normal" };
+    let urgency = urgency_for(notice);
     let resp = client
         .post(&sub.endpoint)
         .header("TTL", ttl.to_string())
@@ -487,7 +514,7 @@ mod tests {
         let receiver_priv_hex = vapid.private_hex.clone();
         let auth = b64u().decode(sub.auth.as_bytes()).unwrap();
         let auth_hex = bytes_to_hex(&auth);
-        let payload = r#"{"title":"РҐРѕРґ Р·Р°РІРµСЂС€С‘РЅ","body":"РјРѕСЃС‚ Р¶РёРІ"}"#;
+        let payload = r#"{"title":"Ход завершён","body":"мост жив"}"#;
         let body = encrypt_payload(&sub, payload).unwrap();
         let back = decrypt_payload(&receiver_priv_hex, &auth_hex, &body).unwrap();
         assert_eq!(back, payload);
@@ -575,7 +602,7 @@ mod tests {
             auth: b64u_encode(&[9u8; 16]),
             created_at: 0.0,
         };
-        let our_payload = r#"{"title":"РќСѓР¶РµРЅ С‚РІРѕР№ РѕС‚РІРµС‚","body":"РёРЅС‚РµСЂРѕРї"}"#;
+        let our_payload = r#"{"title":"Нужен твой ответ","body":"интероп"}"#;
         let body = encrypt_payload(&sub, our_payload).unwrap();
         let input = serde_json::json!({
             "privHex": vapid.private_hex,
@@ -604,5 +631,25 @@ mod tests {
             our_payload,
             "node must read our aes128gcm body"
         );
+    }
+
+    #[test]
+    fn approval_tag_is_high_urgency_others_normal() {
+        // Регрессия: раньше urgency выбирался по contains() на заголовке, который
+        // уехал в mojibake, и ветка "high" была недостижима. Теперь - по tag.
+        let appr = Notice {
+            title: "Нужен твой ответ".into(),
+            body: "x".into(),
+            tag: "appr-session1".into(),
+            session_id: Some("session1".into()),
+        };
+        assert_eq!(urgency_for(&appr), "high");
+        let done = Notice {
+            title: "Ход завершён".into(),
+            body: "x".into(),
+            tag: "turn-session1".into(),
+            session_id: Some("session1".into()),
+        };
+        assert_eq!(urgency_for(&done), "normal");
     }
 }

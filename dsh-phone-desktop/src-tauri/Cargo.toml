@@ -27,15 +27,19 @@ dirs = "5"
 get_if_addrs = "0.5"
 base64 = "0.22"
 sha2 = "0.10"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 # x509-parser: чтобы перечитывать свой же CA из PEM и подписывать им лист
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls-pemfile = "2"
-# Explicit dependency so we can install a CryptoProvider ourselves. Feature
-# unification leaves both `aws-lc-rs` (axum-server) and `ring` (reqwest/rcgen)
-# enabled, and rustls 0.23 *panics* at runtime instead of picking one - which
-# silently killed the whole TLS listener. We call install_default() at startup.
-rustls = { version = "0.23", features = ["ring", "std", "tls12"] }
+# Explicit dependency so we can install a CryptoProvider ourselves. The plain
+# `tls-rustls` feature of axum-server hard-pulls rustls's default provider
+# (aws-lc-rs), which feature-unifies with `ring` (reqwest/rcgen) and makes
+# rustls 0.23 panic at runtime instead of picking one - silently killing the
+# TLS listener. `tls-rustls-no-provider` + default-features=false leaves ring
+# as the ONLY provider (we install_default() it at startup) and drops aws-lc-sys
+# from the tree, which also fixes flaky Windows MSVC builds (cmake/-std:c99).
+# See axum-server#153 / rustls#2148.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # push notifications: Web Push (VAPID + RFC 8291 aes128gcm) and ntfy
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "arithmetic"] }

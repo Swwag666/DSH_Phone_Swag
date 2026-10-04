@@ -512,7 +512,7 @@ fn cleanup_staging(stage: &str, retention_secs: u64) -> usize {
     removed
 }
 
-async fn staging_cleanup_loop(gw: Arc<Gateway>) {
+async fn staging_cleanup_loop(gw: Arc<Gateway>, mut stop: tokio::sync::watch::Receiver<bool>) {
     let stage = gw.cfg.staging_path.clone();
     let retention = gw.cfg.staging_retention_secs;
     loop {
@@ -520,7 +520,13 @@ async fn staging_cleanup_loop(gw: Arc<Gateway>) {
         if n > 0 {
             eprintln!("dsh-phone: staging purged {n} stale attachment(s)");
         }
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+        // Ждём либо час, либо сигнал остановки: раньше задача крутилась вечно и
+        // держала Arc<Gateway> даже после stop_inner - её никто не абортил, и
+        // каждый рестарт оставлял полную копию графа узлов в памяти.
+        tokio::select! {
+            _ = stop.wait_for(|v| *v) => break,
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
     }
 }
 
@@ -710,6 +716,19 @@ async fn draft_config(
     )
 }
 
+/// Шлёт сигнал остановки фоновым задачам serve в момент drop - то есть на любом
+/// выходе из serve (успех, ошибка бинда/TLS, abort из stop_inner). Без этого
+/// staging-loop и loopback-листенер жили вечно после остановки узла.
+struct ShutdownOnDrop(Option<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
 pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
     let port = gw.cfg.listen_port;
     let app = Router::new()
@@ -751,9 +770,19 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
     }
     let addr = SocketAddr::from((host, port));
 
+    // Общий сигнал остановки для фоновых задач, которые serve спавнит сам
+    // (staging-loop, loopback-листенер). Раньше их JoinHandle не возвращались
+    // наружу, stop_inner абортил только serve и хабы - и каждый рестарт
+    // (add/remove device, toggle TLS) оставлял вечные задачи с полной копией
+    // графа Gateway, а старый loopback продолжал принимать RPC с удалёнными
+    // токенами. Drop-guard шлёт сигнал на ЛЮБОМ выходе из serve: успех, ошибка
+    // бинда/TLS или abort из stop_inner.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let _stop_guard = ShutdownOnDrop(Some(stop_tx));
+
     // Staged attachments no longer live forever: hourly purge of files
     // older than staging_retention_secs (7 days by default).
-    tokio::spawn(staging_cleanup_loop(gw.clone()));
+    tokio::spawn(staging_cleanup_loop(gw.clone(), stop_rx.clone()));
 
     if gw.cfg.tls_enabled {
         match crate::tls::rustls_config(&gw.cfg).await {
@@ -767,7 +796,7 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
                 // loopback-only HTTP listener on port+1 (API routes only - the
                 // PWA keeps going through https).
                 let loop_port = port.saturating_add(1);
-                spawn_loopback_http(gw.clone(), loop_port);
+                spawn_loopback_http(gw.clone(), loop_port, stop_rx.clone());
 
                 let handle = axum_server::Handle::new();
                 let h2 = handle.clone();
@@ -811,7 +840,7 @@ pub async fn serve(gw: Arc<Gateway>, mut rx: tokio::sync::mpsc::Receiver<()>) {
 /// loopback + allowed-origin gated on the main port. A local process able to
 /// call loopback endpoints could do the same before TLS was turned on, so the
 /// local threat model is unchanged - the tailnet one is now encrypted.
-fn spawn_loopback_http(gw: Arc<Gateway>, port: u16) {
+fn spawn_loopback_http(gw: Arc<Gateway>, port: u16, mut stop: tokio::sync::watch::Receiver<bool>) {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/draft-config", get(draft_config))
@@ -828,10 +857,15 @@ fn spawn_loopback_http(gw: Arc<Gateway>, port: u16) {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 eprintln!("dsh-phone: loopback http (plugin) on 127.0.0.1:{port}");
+                // graceful shutdown по общему сигналу: без него листенер жил
+                // вечно после stop_inner и держал порт + старый Gateway.
                 let _ = axum::serve(
                     listener,
                     app.into_make_service_with_connect_info::<SocketAddr>(),
                 )
+                .with_graceful_shutdown(async move {
+                    let _ = stop.wait_for(|v| *v).await;
+                })
                 .await;
             }
             Err(e) => eprintln!("dsh-phone: loopback http bind {addr}: {e}"),
