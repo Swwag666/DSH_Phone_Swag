@@ -1,0 +1,11 @@
+{
+  "appId": "com.rustvy.dshphone",
+  "appName": "DSH Phone",
+  "webDir": "../web",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}

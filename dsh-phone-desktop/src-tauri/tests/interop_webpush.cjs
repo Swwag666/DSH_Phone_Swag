@@ -67,7 +67,10 @@ async function main() {
     const webpush = require("web-push");
     const ecdh = crypto.createECDH("prime256v1");
     ecdh.generateKeys();
-    const privHex = ecdh.getPrivateKey("hex");
+    // getPrivateKey("hex") не дополняет ведущие нули: если скаляр начинается с
+    // 0x00, строка короче 64 символов и Rust-декодер падает с "priv len".
+    // Приводим к фиксированным 32 байтам.
+    const privHex = ecdh.getPrivateKey("hex").padStart(64, "0");
     const authBuf = crypto.randomBytes(16);
     const payload = JSON.stringify({ title: "Работа завершена", body: "интероп-тест" });
     const sub = {

@@ -1,0 +1,26 @@
+{
+  "name": "dsh-phone-bridge",
+  "version": "0.4.0",
+  "description": "Native DSH bridge plugin: pushes sessions, events and bridge status from DSH Desktop straight to the dsh-phone node over HTTP (127.0.0.1:8460), removing the dependency on the Agents Anywhere bridge (endpoint.json + TCP JSON-RPC). Browser half sniffs the desktop's own session/event traffic and forwards it; the node ingests it via /api/bridge/ingest.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT"
+}

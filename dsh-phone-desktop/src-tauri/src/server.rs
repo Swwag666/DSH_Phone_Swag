@@ -215,6 +215,17 @@ struct RpcBody {
     params: Value,
 }
 
+#[derive(Deserialize)]
+struct IngestBody {
+    #[serde(default)]
+    token: String,
+    /// "status" | "sessions" | "event"
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    data: Value,
+}
+
 async fn rpc(State(gw): State<Arc<Gateway>>, Json(b): Json<RpcBody>) -> Response {
     let hub = match gw.find_hub(&b.token) {
         Some(h) => h,
@@ -778,6 +789,24 @@ async fn draft_config(
     )
 }
 
+/// Приём push-данных от нативного плагина dsh-phone-bridge: статус моста,
+/// сессии и события синк-фида приходят по HTTP вместо TCP-моста Agents
+/// Anywhere. Токен обязателен (как у /api/rpc), данные кладутся в тот же
+/// event-feed, что и bridge-уведомления, поэтому телефон видит их одинаково.
+async fn bridge_ingest(State(gw): State<Arc<Gateway>>, Json(b): Json<IngestBody>) -> Response {
+    let hub = match gw.find_hub(&b.token) {
+        Some(h) => h,
+        None => {
+            return json_status(
+                StatusCode::UNAUTHORIZED,
+                json!({ "ok": false, "error": "unauthorized" }),
+            )
+        }
+    };
+    hub.ingest_bridge(&b.kind, b.data);
+    json_status(StatusCode::OK, json!({ "ok": true }))
+}
+
 /// Шлёт сигнал остановки фоновым задачам serve в момент drop - то есть на любом
 /// выходе из serve (успех, ошибка бинда/TLS, abort из stop_inner). Без этого
 /// staging-loop и loopback-листенер жили вечно после остановки узла.
@@ -805,6 +834,7 @@ fn build_router(gw: &Arc<Gateway>) -> Router {
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
         .route("/api/draft-config", get(draft_config))
+        .route("/api/bridge/ingest", post(bridge_ingest))
         .route("/api/watch", post(watch))
         .route("/api/push/info", get(push_info))
         .route("/api/push/subscribe", post(push_subscribe))
@@ -935,6 +965,7 @@ fn spawn_loopback_http(gw: Arc<Gateway>, port: u16, mut stop: tokio::sync::watch
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/draft-config", get(draft_config))
+        .route("/api/bridge/ingest", post(bridge_ingest))
         .route("/api/rpc", post(rpc))
         .route("/api/events", get(events))
         .route("/api/watch", post(watch))

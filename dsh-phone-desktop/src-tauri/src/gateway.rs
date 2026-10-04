@@ -57,6 +57,10 @@ pub struct DeviceHub {
     pub token: String,
     pub connector_id: String,
     pub bridge: Arc<Bridge>,
+    /// Нативный плагин dsh-phone-bridge пушит статус/события по HTTP, минуя
+    /// TCP-мост Agents Anywhere. Пока плагин шлёт heartbeat, узел считается
+    /// подключённым даже без endpoint.json/AA - независимость от внешнего моста.
+    plugin_connected: AtomicBool,
     state: Mutex<HubState>,
     outbox: Mutex<VecDeque<OutgoingTurn>>,
     gen: AtomicU64,
@@ -185,6 +189,7 @@ impl DeviceHub {
             token,
             connector_id,
             bridge,
+            plugin_connected: AtomicBool::new(false),
             state: Mutex::new(HubState {
                 events: VecDeque::new(),
                 events_bytes: 0,
@@ -422,6 +427,34 @@ impl DeviceHub {
         }
         let g = self.gen.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.gen_tx.send(g);
+    }
+
+    /// Приём данных от нативного плагина dsh-phone-bridge (HTTP push вместо
+    /// TCP-моста AA). Плагин шлёт готовые события/сессии/статус - кладём их в
+    /// тот же event-feed, что и bridge-уведомления, поэтому телефон видит их
+    /// одинаково. Статус дополнительно поднимает plugin_connected, чтобы узел
+    /// считался подключённым без Agents Anywhere.
+    pub fn ingest_bridge(&self, kind: &str, data: Value) {
+        match kind {
+            "status" => {
+                let connected = data.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+                self.plugin_connected.store(connected, Ordering::Relaxed);
+                self.push_event(
+                    "bridge",
+                    json!({ "status": if connected { "connected" } else { "disconnected" }, "source": "plugin" }),
+                );
+            }
+            "sessions" => self.push_event("sessions", data),
+            "event" => {
+                let t = data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("event")
+                    .to_string();
+                self.push_event(&t, data);
+            }
+            _ => {}
+        }
     }
 
     pub async fn collect_events(&self, since: f64) -> Vec<Event> {
@@ -1131,7 +1164,8 @@ impl Gateway {
     }
 
     pub fn is_bridge_connected(&self) -> bool {
-        self.main_hub().bridge.is_connected()
+        let h = self.main_hub();
+        h.bridge.is_connected() || h.plugin_connected.load(Ordering::Relaxed)
     }
 
     pub fn device_briefs(&self) -> Vec<DeviceBrief> {
@@ -1142,7 +1176,7 @@ impl Gateway {
                 name: h.name.clone(),
                 token: h.token.clone(),
                 connector_id: h.connector_id.clone(),
-                connected: h.bridge.is_connected(),
+                connected: h.bridge.is_connected() || h.plugin_connected.load(Ordering::Relaxed),
                 main: i == 0,
             })
             .collect()

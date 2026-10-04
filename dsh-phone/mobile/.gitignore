@@ -1,0 +1,18 @@
+node_modules/
+*.log
+.DS_Store
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/build/
+android/local.properties
+
+# iOS build artifacts
+ios/App/Pods/
+ios/App/build/
+ios/App/App/build/
+ios/App/App.xcworkspace/xcuserdata/
+ios/App/App.xcodeproj/xcuserdata/
+ios/.DS_Store

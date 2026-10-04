@@ -151,8 +151,8 @@ run.bat        :: или: python gateway.py
 - [x] Пуши через Web Push (+ ntfy как запасной канал)
 - [x] QR-подключение телефона без набора токена
 - [x] Автообновление из GitHub Releases + CI на таг
-- [ ] Нативные оболочки (Capacitor), сторы
-- [ ] Свой плагин DSH вместо моста AA - полная независимость
+- [x] Нативные оболочки (Capacitor): проект `dsh-phone/mobile` (android/ + ios/) готов к сборке; сборка APK/IPA и публикация в сторы требуют Android SDK+JDK / macOS+Xcode и аккаунтов разработчика
+- [x] Свой плагин DSH (`dsh-phone-bridge`) вместо моста AA: плагин пушит сессии/события/статус узлу по HTTP (`/api/bridge/ingest`), узел независим от Agents Anywhere
 
 ## Сборка из исходников
 
