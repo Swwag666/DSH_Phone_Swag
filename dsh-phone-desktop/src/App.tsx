@@ -147,6 +147,14 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
     allowlistApply: "применить",
     allowlistSaved: "список сохранён",
+    draftPing: "Черновики десктопа",
+    draftPingNone: "web-половина плагина не отстукивалась: черновики не синхронизируются",
+    draftBound: "сессия привязана",
+    draftNoSession: "сессия не привязана",
+    draftComposer: "композитор найден",
+    draftNoComposer: "композитор не найден",
+    allowlistOpen:
+      "список пуст при host 0.0.0.0: узел слышит всех, кто дотянется до порта. Сузь до 100.64.0.0/10",
     push: "Уведомления",
     pushHint: "ход завершён / агент ждёт ответа - прилетает на телефон, даже когда PWA закрыта",
     pushTest: "тест",
@@ -284,6 +292,14 @@ const dict: Record<Lang, Record<string, string>> = {
     allowlistPlaceholder: "100.75.97.90, 100.64.0.0/10",
     allowlistApply: "apply",
     allowlistSaved: "allowlist saved",
+    draftPing: "Desktop drafts",
+    draftPingNone: "the plugin web half never pinged: drafts are not syncing",
+    draftBound: "session bound",
+    draftNoSession: "no session bound",
+    draftComposer: "composer found",
+    draftNoComposer: "composer not found",
+    allowlistOpen:
+      "empty list with host 0.0.0.0: anyone who reaches the port is let in. Narrow it to 100.64.0.0/10",
     push: "Notifications",
     pushHint: "turn finished / agent needs you - lands on the phone even with the PWA closed",
     pushTest: "test",
@@ -1530,9 +1546,35 @@ export default function App() {
                     </div>
                   )}
                 </div>
+                <div className="py-2.5 border-b border-edge">
+                  <div className="text-[13px] text-bone mb-0.5">{t("draftPing")}</div>
+                  {status?.draft_ping ? (
+                    <div className="text-[11.5px] leading-relaxed">
+                      <span className={status.draft_ping.hasSession ? "text-moss" : "text-ember"}>
+                        ● {status.draft_ping.hasSession ? t("draftBound") : t("draftNoSession")}
+                      </span>
+                      <span className="text-ash"> · </span>
+                      <span className={status.draft_ping.hasComposer ? "text-moss" : "text-ember"}>
+                        {status.draft_ping.hasComposer ? t("draftComposer") : t("draftNoComposer")}
+                      </span>
+                      {status.draft_ping.url && (
+                        <div className="mono-badge mt-1 break-all text-[11px] text-ash">
+                          {status.draft_ping.url}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-[11.5px] text-ash">{t("draftPingNone")}</div>
+                  )}
+                </div>
                 <div className="py-2.5">
                   <div className="text-[13px] text-bone mb-0.5">{t("allowlist")}</div>
                   <div className="text-[11.5px] text-ash mb-2">{t("allowlistHint")}</div>
+                  {(cfg?.allowed_ips ?? []).length === 0 && cfg?.listen_host === "0.0.0.0" && (
+                    <div className="mb-2 rounded-sm border border-blood/30 bg-blood/10 px-3 py-2 text-[11.5px] text-ember">
+                      {t("allowlistOpen")}
+                    </div>
+                  )}
                   <div className="flex items-center gap-2">
                     <input
                       value={ipList}

@@ -37,6 +37,16 @@ export interface ServerStatus {
   tls_sha256?: string | null;
   tls_serving?: string | null;
   tls_error?: string | null;
+  /** Последний `session.pluginPing` web-половины плагина: привязана ли сессия
+   * DSH и найден ли композитор. null/undefined = плагин не отстукивался. */
+  draft_ping?: {
+    origin?: string;
+    hasSession?: boolean;
+    sessionId?: string;
+    sessionSource?: string;
+    hasComposer?: boolean;
+    url?: string;
+  } | null;
   devices?: DeviceBrief[];
 }
 

@@ -54,6 +54,9 @@ pub struct ServerStatus {
     pub tls_serving: Option<String>,
     /// Причина, по которой TLS не поднялся. None = всё хорошо.
     pub tls_error: Option<String>,
+    /// Последний `session.pluginPing` от web-половины плагина: привязана ли
+    /// сессия DSH и найден ли композитор. None = плагин не отстукивался.
+    pub draft_ping: Option<serde_json::Value>,
     pub devices: Vec<gateway::DeviceBrief>,
 }
 
@@ -93,6 +96,7 @@ fn status_of(state: &ServerState) -> ServerStatus {
                 tls_sha256,
                 tls_serving,
                 tls_error,
+                draft_ping: s.gw.plugin_ping_snapshot(),
                 devices: s.gw.device_briefs(),
             }
         }
@@ -105,6 +109,7 @@ fn status_of(state: &ServerState) -> ServerStatus {
             // узел не поднят - утверждать схему нечего
             tls_serving: None,
             tls_error,
+            draft_ping: None,
             devices: Vec::new(),
         },
     }

@@ -1425,6 +1425,13 @@ impl Gateway {
             })
             .collect()
     }
+
+    /// Последний heartbeat web-половины плагина (`session.pluginPing`) по всем
+    /// hub'ам устройств: дашборд показывает, привязана ли сессия DSH и найден ли
+    /// композитор. None = плагин не отстукивался ни разу.
+    pub fn plugin_ping_snapshot(&self) -> Option<serde_json::Value> {
+        self.hubs.iter().find_map(|h| h.plugin_ping_snapshot())
+    }
 }
 
 #[cfg(test)]
