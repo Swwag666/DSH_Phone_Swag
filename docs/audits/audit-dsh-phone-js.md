@@ -4,6 +4,14 @@
 Файлы: `dsh-phone/web/app.js` (1758 строк), `dsh-phone/web/sw.js` (134), `dsh-phone/gui/draftsync-desktop.js` (295), `dsh-phone/plugin/dsh-draft-sync/lib/client.js` (453).
 Дополнительно просмотрены (контекст): `dsh-phone/web/draftsync.js`, `dsh-phone/web/index.html`, `dsh-phone/plugin/dsh-draft-sync/lib/index.js`.
 
+> Пометка на 2026-10-04: аудит исторический, пути в нём - на момент проведения.
+> Папки `dsh-phone/plugin/dsh-draft-sync/` больше нет: движок черновиков влит в
+> `dsh-phone/plugin/dsh-phone-bridge/lib/client.js`, теперь один плагин делает и
+> мост, и черновики. Фиксы P1-P10 при переносе сохранены, а пункт про два
+> движка в одном документе (два поллинга `/api/events`, два MutationObserver,
+> эхо-цикл) закрыт самим слиянием: перехват сети, heartbeat, доступ к композитору
+> и teardown теперь общие.
+
 Сводка по серьёзности: critical — 2 (P1, P2/D2 в gui-версии), high — 8, medium — 12, low — 8, informational — 5.
 
 ---

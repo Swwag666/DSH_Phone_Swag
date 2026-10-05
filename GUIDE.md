@@ -13,7 +13,7 @@
 | Windows 10/11 | уже есть | ПК-узел |
 | [Tailscale](https://tailscale.com/download) | tailscale.com | приватный туннель ПК ↔ телефон |
 | DeepSeek Harness Desktop | твой дистрибутив | сам агент |
-| Плагин **dsh-phone-bridge** | `dsh-phone/plugin/dsh-phone-bridge` в этом репо | свой мост JSON-RPC, рекомендуется |
+| Плагин **dsh-phone-bridge** | `dsh-phone/plugin/dsh-phone-bridge` в этом репо | свой мост JSON-RPC + синхронизация черновика, рекомендуется |
 | Плагин **Agents Anywhere** | включается в DSH Desktop | запасной мост JSON-RPC |
 | `releases/dsh-phone-setup.exe` | из этого репо | узел |
 
@@ -39,6 +39,10 @@
 плагин не зависит от Agents Anywhere, не требует учётки и облака, и узел пробует
 его первым. Вариант B пригодится, если свой плагин поставить нельзя.
 
+Плагин один на две задачи: он же синхронизирует черновик поля ввода между
+телефоном и DSH Desktop. Отдельного `dsh-draft-sync` больше нет - он влит в
+`dsh-phone-bridge`.
+
 ### Вариант A (рекомендуется): свой плагин dsh-phone-bridge
 
 1. Запусти DeepSeek Harness Desktop, залогинься и **закрой** его.
@@ -55,6 +59,14 @@
 > Записи нет в lockfile профиля, поэтому любая команда вида
 > `dsh plugin --profile desktop add ...` (или pnpm install в профиле) может
 > снести папку - просто скопируй её заново из репо.
+
+> Если раньше стоял отдельный плагин `dsh-draft-sync`, убери его: удали строку
+> `"dsh-draft-sync"` из `dsh.profile.bundles` и папку
+> `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-draft-sync\`. Иначе
+> черновик ведут два движка сразу: лишний long-poll `/api/events`, второй
+> MutationObserver на документ и риск эха. Объединённый плагин чужой движок
+> замечает, уступает ему черновики и пишет предупреждение в консоль десктопа, но
+> правильный вариант - старый удалить.
 
 ### Вариант B: плагин Agents Anywhere
 

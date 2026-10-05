@@ -37,6 +37,33 @@ jobs:
       - name: Run QR sign-in tests
         run: node dsh-phone/web/test-qr.js
 
+  plugin:
+    name: dsh-phone-bridge plugin tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dsh-phone/plugin/dsh-phone-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Зависимостей нет: плагин намеренно не тянет ни cordis, ни внешние пакеты,
+      # поэтому install-шаг не нужен и не может разъехаться с lockfile.
+      - name: Syntax check every js/mjs
+        run: |
+          find lib scripts test -type f \( -name '*.js' -o -name '*.mjs' \) -print0 \
+            | xargs -0 -n1 node --check
+      - name: Unit tests (host modules + browser half + wire protocol)
+        run: node --test
+      - name: Host bridge smoke (protocol, read path, sync feed)
+        run: node scripts/smoke-host-bridge.mjs
+      - name: Host write-path smoke (createAndStart, startTurn, selections)
+        run: node scripts/smoke-host-write.mjs
+      - name: Cordis lifecycle smoke (skips when cordis is unavailable)
+        run: node scripts/smoke-cordis-lifecycle.mjs
+
   rust:
     name: Rust core tests
     runs-on: windows-latest
@@ -68,3 +95,12 @@ jobs:
       - name: Clippy (fail on warnings)
         working-directory: dsh-phone-desktop/src-tauri
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Смоук HTTP-канала плагина: поднимает настоящий процесс узла на временном
+      # конфиге (боевой ~/.dsh-phone не трогает) с отключёнными TCP-мостами и
+      # прогоняет hello -> poll -> result -> event-feed -> RPC телефона -> метрики.
+      - name: Build debug node binary
+        working-directory: dsh-phone-desktop/src-tauri
+        run: cargo build --locked
+      - name: Plugin HTTP channel smoke
+        working-directory: dsh-phone-desktop/src-tauri
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/smoke-plugin-channel.ps1

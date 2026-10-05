@@ -5,7 +5,9 @@
   window[MARK] = true;
 
   // --- P8: one draft-sync engine per document -----------------------------
-  // The plugin engine (plugin/dsh-draft-sync/lib/client.js) is the richer one
+  // The plugin engine (plugin/dsh-phone-bridge/lib/client.js - draft sync now
+  // ships inside the bridge plugin, there is no separate dsh-draft-sync) is the
+  // richer one
   // (full teardown, heartbeat, XHR sniffing). If its module is present in this
   // document, this patch stands down instead of running a second engine. If
   // this patch armed first, it publishes a stop hook so the plugin can take
