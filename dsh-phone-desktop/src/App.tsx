@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   AppConfig,
   ServerStatus,
@@ -39,6 +40,10 @@ type Lang = "ru" | "en";
 const dict: Record<Lang, Record<string, string>> = {
   ru: {
     sub: "локальный мост · телефон ↔ ПК",
+    winMin: "свернуть",
+    winMax: "развернуть",
+    winRestore: "восстановить",
+    winClose: "закрыть",
     nodeOn: "узел активен",
     nodeOff: "узел заглушён",
     hero: "Связь на проводе.",
@@ -63,7 +68,7 @@ const dict: Record<Lang, Record<string, string>> = {
     s3: "Открой на телефоне",
     s4t: "Ключ",
     s4: "Вставь токен из карточки справа.",
-    note: "Без запущенного DSH Desktop на этом ПК узел молчит. Плагин Agents Anywhere — единственный пропуск.",
+    note: "Без запущенного DSH Desktop на этом ПК узел молчит. Пропуск - плагин dsh-phone-bridge (рекомендуется) или Agents Anywhere.",
     key: "Ключ доступа",
     issuing: "выдаю…",
     copyBtn: "Скопировать",
@@ -172,6 +177,10 @@ const dict: Record<Lang, Record<string, string>> = {
   },
   en: {
     sub: "local bridge · phone ↔ PC",
+    winMin: "minimize",
+    winMax: "maximize",
+    winRestore: "restore",
+    winClose: "close",
     nodeOn: "node online",
     nodeOff: "node offline",
     hero: "The line is live.",
@@ -196,7 +205,7 @@ const dict: Record<Lang, Record<string, string>> = {
     s3: "Open this on the phone",
     s4t: "Key",
     s4: "Paste the token from the card on the right.",
-    note: "Without DSH Desktop running on this PC the node stays silent. The Agents Anywhere plugin is the only way in.",
+    note: "Without DSH Desktop running on this PC the node stays silent. The way in is the dsh-phone-bridge plugin (recommended) or Agents Anywhere.",
     key: "Access key",
     issuing: "issuing…",
     copyBtn: "Copy",
@@ -437,6 +446,106 @@ function TunnelFeed({ active }: { active: boolean }) {
         {lines.map((l, i) => (
           <div key={i} className={"tfl " + l.k}>{l.t}</div>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// Своя панель окна. Системную рамку выключили (decorations: false в
+// tauri.conf.json), поэтому свернуть/развернуть/закрыть и перетаскивание окна
+// живут здесь, в стиле дашборда, а не в сером хроме Windows. Панель - зона
+// перетаскивания (data-tauri-drag-region), двойной клик по ней разворачивает
+// окно, как это делала системная рамка.
+function TitleBar({ t }: { t: (k: string) => string }) {
+  const [maximized, setMaximized] = useState(false);
+  const [inTauri, setInTauri] = useState(false);
+
+  useEffect(() => {
+    // Вне Tauri (обычный браузер, скриншоты, тесты рендера) окна нет: панель
+    // отрисуется, но кнопки молчат вместо исключения.
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    setInTauri(true);
+    let off: (() => void) | undefined;
+    let dead = false;
+    const w = getCurrentWindow();
+    const refresh = () => {
+      w.isMaximized()
+        .then((m) => {
+          if (!dead) setMaximized(m);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    w.onResized(refresh)
+      .then((fn) => {
+        off = fn;
+      })
+      .catch(() => {});
+    return () => {
+      dead = true;
+      if (off) off();
+    };
+  }, []);
+
+  const act = (fn: (w: ReturnType<typeof getCurrentWindow>) => Promise<unknown>) => () => {
+    if (!inTauri) return;
+    fn(getCurrentWindow()).catch(() => {});
+  };
+
+  const btn =
+    "flex h-8 w-11 items-center justify-center text-ash transition hover:bg-edge/40 hover:text-bone";
+
+  return (
+    <div
+      data-tauri-drag-region
+      className="relative z-30 flex h-9 shrink-0 select-none items-center justify-between border-b border-edge bg-ink/85 pl-3 pr-1"
+    >
+      <div data-tauri-drag-region className="flex items-center gap-2">
+        <span data-tauri-drag-region className="text-[10px] text-blood">
+          ◆
+        </span>
+        <span data-tauri-drag-region className="mono-badge text-[10.5px] tracking-[0.18em] text-ash">
+          DSH PHONE
+        </span>
+      </div>
+      <div className="flex items-center">
+        <button
+          className={btn}
+          onClick={act((w) => w.minimize())}
+          title={t("winMin")}
+          aria-label={t("winMin")}
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+            <path d="M1 5h8" stroke="currentColor" strokeWidth="1.2" />
+          </svg>
+        </button>
+        <button
+          className={btn}
+          onClick={act((w) => w.toggleMaximize())}
+          title={maximized ? t("winRestore") : t("winMax")}
+          aria-label={maximized ? t("winRestore") : t("winMax")}
+        >
+          {maximized ? (
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+              <path d="M3.5 3.5h5v5h-5z" stroke="currentColor" strokeWidth="1.1" />
+              <path d="M1.5 6.5v-5h5" stroke="currentColor" strokeWidth="1.1" />
+            </svg>
+          ) : (
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="7" height="7" stroke="currentColor" strokeWidth="1.1" />
+            </svg>
+          )}
+        </button>
+        <button
+          className="flex h-8 w-11 items-center justify-center text-ash transition hover:bg-blood/80 hover:text-bone"
+          onClick={act((w) => w.close())}
+          title={t("winClose")}
+          aria-label={t("winClose")}
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+            <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" strokeWidth="1.2" />
+          </svg>
+        </button>
       </div>
     </div>
   );
@@ -815,7 +924,9 @@ export default function App() {
   const running = status?.running ?? false;
 
   return (
-    <div className="relative h-full w-full overflow-y-auto">
+    <div className="flex h-full w-full flex-col">
+      <TitleBar t={t} />
+      <div className="relative min-h-0 flex-1 overflow-y-auto">
       <div className="grid-backdrop" />
       <div className="blood-glow" />
       <div className="vignette" />
@@ -1452,6 +1563,7 @@ export default function App() {
           </span>
           <span className="mono-badge">{t("ver")}</span>
         </footer>
+      </div>
       </div>
 
       {/* toast */}
