@@ -191,8 +191,13 @@ test("конверт проверяется: одновременный повт
 		// Два одинаковых id одновременно: второй обязан быть отвергнут, иначе
 		// ответ нельзя однозначно сопоставить запросу. Последовательный повтор
 		// того же id легален (проверяется именно набор запросов в полёте).
-		client.send({ jsonrpc: "2.0", id: "dup", method: "ping", params: {} });
-		client.send({ jsonrpc: "2.0", id: "dup", method: "ping", params: {} });
+		// Одновременность на проводе гарантируется ОДНИМ write: два отдельных
+		// socket.write TCP может доставить двумя data-событиями, и тогда первый
+		// ping успевает микрозадачно завершиться (pong + inFlight.delete) до
+		// dispatch второго — повтора id в полёте уже нет, и оба ответа легально
+		// успешны. На Linux CI (Nagle, epoll) split был стабильным флейком.
+		const dup = JSON.stringify({ jsonrpc: "2.0", id: "dup", method: "ping", params: {} }) + "\n";
+		client.socket.write(dup + dup);
 		const a = await client.next();
 		const b = await client.next();
 		const rejected = [a, b].find((frame) => frame && frame.error);
